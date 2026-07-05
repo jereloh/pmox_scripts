@@ -22,17 +22,29 @@ while [[ -z "$STORAGE" ]]; do
   if [[ -z "$STORAGE" ]]; then echo "Error: Storage Pool cannot be empty."; fi
 done
 
-# 4. Request Password (Forced)
+# 4. Request LXC Console Root Password (Forced)
 while [[ -z "$PASSWORD" ]]; do
-  read -p "Enter a temporary root password for the LXC: " PASSWORD
+  read -p "Enter a temporary root password for the LXC console: " PASSWORD
   if [[ -z "$PASSWORD" ]]; then echo "Error: Password cannot be empty."; fi
 done
 
-# 5. Request Disk Size
+# 5. Request KasmVNC Web UI Credentials (Forced)
+echo -e "\n--- Configure KasmVNC Web Login ---"
+while [[ -z "$VNC_USER" ]]; do
+  read -p "Enter Web UI Username (e.g., admin): " VNC_USER
+  if [[ -z "$VNC_USER" ]]; then echo "Error: Username cannot be empty."; fi
+done
+while [[ -z "$VNC_PASS" ]]; do
+  read -s -p "Enter Web UI Password: " VNC_PASS
+  echo ""
+  if [[ -z "$VNC_PASS" ]]; then echo "Error: Password cannot be empty."; fi
+done
+
+# 6. Request Disk Size
 read -p "Enter disk size in GB (Default: 10): " DISK_SIZE
 DISK_SIZE=${DISK_SIZE:-10}
 
-# 6. Request Privilege Status
+# 7. Request Privilege Status
 read -p "Run as an Unprivileged container? [y/n] (Default: y): " IS_UNPRIV
 IS_UNPRIV=${IS_UNPRIV:-y}
 if [[ "$IS_UNPRIV" =~ ^[Nn]$ ]]; then
@@ -41,7 +53,7 @@ else
   UNPRIV_FLAG="--unprivileged 1"
 fi
 
-# 7. Request Network Settings
+# 8. Request Network Settings
 read -p "Use DHCP for IP address? [y/n] (Default: y): " USE_DHCP
 USE_DHCP=${USE_DHCP:-y}
 if [[ "$USE_DHCP" =~ ^[Nn]$ ]]; then
@@ -56,7 +68,6 @@ echo -e "\nStarting installation...\n"
 
 echo "[1/4] Downloading Ubuntu 24.04 Template..."
 pveam update
-# CHANGED: Now pulls the 24.04 template instead of 22.04
 TEMPLATE=$(pveam available | grep -m 1 'ubuntu-24.04-standard' | awk '{print $2}')
 
 if [ -z "$TEMPLATE" ]; then
@@ -82,7 +93,7 @@ echo "[3/4] Starting LXC and waiting for network..."
 pct start $CTID
 sleep 15 
 
-echo "[4/4] Provisioning Chrome, Openbox, KasmVNC 1.4.0 (Noble), and Cloudflared..."
+echo "[4/4] Provisioning Chrome, Openbox, KasmVNC 1.4.0, and Cloudflared..."
 pct exec $CTID -- bash -c "
   apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl openbox dbus-x11 sudo
@@ -92,7 +103,7 @@ pct exec $CTID -- bash -c "
   DEBIAN_FRONTEND=noninteractive apt-get install -y ./google-chrome-stable_current_amd64.deb
   rm google-chrome-stable_current_amd64.deb
   
-  # CHANGED: Install KasmVNC 1.4.0 for Noble (24.04)
+  # Install KasmVNC 1.4.0 for Noble
   wget -q https://github.com/kasmtech/KasmVNC/releases/download/v1.4.0/kasmvncserver_noble_1.4.0_amd64.deb
   DEBIAN_FRONTEND=noninteractive apt-get install -y ./kasmvncserver_noble_1.4.0_amd64.deb
   rm kasmvncserver_noble_1.4.0_amd64.deb
@@ -107,12 +118,26 @@ google-chrome --no-sandbox --start-maximized --disable-gpu &
 EOF
   chmod +x /root/.vnc/xstartup
   
+  # AUTOMATED KASMVNC INITIALIZATION
+  # Option 1 (Create user) -> Username -> Password -> Confirm Password -> View-only (No) -> Option 1 (Manual xstartup)
+  printf '1\n%s\n%s\n%s\nn\n1\n' \"$VNC_USER\" \"$VNC_PASS\" \"$VNC_PASS\" | vncserver
+  
   # Install Cloudflared
   curl -sL --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
   dpkg -i cloudflared.deb
   rm cloudflared.deb
 "
 
+# Get the container IP to display at the end
+LXC_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
+
 echo -e "\n========================================="
-echo "✅ Kasm-Chrome LXC ($CTID) Provisioned Successfully on Ubuntu 24.04!"
+echo "✅ Kasm-Chrome LXC ($CTID) Provisioned Successfully!"
+echo "========================================="
+echo "Local Access URL: https://${LXC_IP}:8444"
+echo "Username: $VNC_USER"
+echo "-----------------------------------------"
+echo "Next Step (Optional Cloudflare Tunnel):"
+echo "1. Open the LXC console or SSH into it."
+echo "2. Run: cloudflared service install [YOUR_TOKEN]"
 echo "========================================="

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Proxmox Host Script: Create Kasm-Chrome LXC (Ubuntu 24.04) 
-# Usage: bash -c "$(curl -fsSL https://github.com/jereloh/pmox_scripts/blob/main/kasm-chrome.sh)"
+# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-chrome.sh)"
 # Features: AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
 
 echo "=== Kasm-Chrome LXC Provisioning Script (Version 8) ==="

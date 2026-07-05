@@ -2,8 +2,7 @@
 # Proxmox Host Script: Create Kasm-Chrome LXC (Ubuntu 24.04) 
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-chrome.sh)"
 # Features: AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
-
-echo "=== Kasm-Chrome LXC Provisioning Script (Version 9) ==="
+echo "=== Kasm-Chrome LXC Provisioning Script (Version 10) ==="
 
 # Pre-flight check for jq dependency on host
 which jq >/dev/null || { echo "Installing jq on host..."; apt update && apt install -y jq; }
@@ -22,6 +21,9 @@ if [[ "$USE_DHCP" =~ ^[Nn]$ ]]; then
   read -p "Static IP (e.g. 192.168.1.50/24): " STATIC_IP; read -p "Gateway: " STATIC_GW
   NET_CONFIG="name=eth0,bridge=vmbr0,ip=${STATIC_IP},gw=${STATIC_GW}"
 else NET_CONFIG="name=eth0,bridge=vmbr0,ip=dhcp"; fi
+
+# Optional Cloudflared Token
+read -p "Enter Cloudflare Tunnel Token (Leave blank to skip): " CF_TOKEN
 
 # 2. Interactive iGPU Passthrough Request
 HAS_GPU=0
@@ -96,10 +98,20 @@ wget -q "https://github.com/kasmtech/KasmVNC/releases/download/${LATEST_TAG}/${D
 apt-get install -y ./${DEB_FILE}
 rm ${DEB_FILE}
 
+# Install Cloudflared
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+dpkg -i cloudflared-linux-amd64.deb
+rm cloudflared-linux-amd64.deb
+
 adduser root ssl-cert
 systemctl daemon-reload
 systemctl enable kasmvnc
 EOF
+
+# Append the Cloudflare token installation if provided
+if [ -n "$CF_TOKEN" ]; then
+    echo "cloudflared service install $CF_TOKEN" >> /tmp/provision.sh
+fi
 
 # 4. Create Container
 echo "[i] Updating appliance templates..."
@@ -158,6 +170,11 @@ if [ "$HAS_GPU" -eq 1 ]; then
     echo "🎮 GPU Passthrough: Enabled & Configured"
 else
     echo "💻 GPU Passthrough: Bypassed/Not Found (Software Rendering)"
+fi
+if [ -n "$CF_TOKEN" ]; then
+    echo "☁️  Cloudflared: Installed and Registered"
+else
+    echo "☁️  Cloudflared: Installed (Pending Manual Registration)"
 fi
 echo "-----------------------------------------"
 echo "1. Run: 'pct enter $CTID'"

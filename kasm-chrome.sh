@@ -57,8 +57,13 @@ echo -e "\nStarting installation...\n"
 # --- GENERATE CONFIG ON HOST ---
 cat << 'EOF' > /tmp/xstartup
 #!/bin/bash
+# Start a fake dbus session so Chrome thinks a network manager exists
+export $(dbus-launch)
+
 openbox-session &
-google-chrome --no-sandbox --test-type --disable-gpu --disable-dev-shm-usage --proxy-server="direct://" --proxy-bypass-list=* --no-first-run --start-maximized &
+
+# Disable async-dns to force Chrome to use the working LXC network
+google-chrome --no-sandbox --test-type --disable-gpu --disable-async-dns --start-maximized &
 EOF
 # --------------------------------
 
@@ -86,6 +91,10 @@ pct create $CTID local:vztmpl/${TEMPLATE##*/} \
   --features nesting=1 \
   $UNPRIV_FLAG
 
+# --- THE APPARMOR OVERRIDE ---
+echo "Applying AppArmor bypass to fix Chrome networking..."
+echo "lxc.apparmor.profile: unconfined" >> /etc/pve/lxc/$CTID.conf
+
 echo "[3/4] Starting LXC and injecting configurations..."
 pct start $CTID
 sleep 15 
@@ -102,7 +111,8 @@ pct exec $CTID -- bash -c "
   chmod +x /root/.vnc/xstartup
 
   apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl openbox dbus-x11 sudo
+  # Installing ca-certificates and dbus-x11 for full network/dbus support
+  DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl openbox dbus-x11 sudo ca-certificates
   
   # Install Google Chrome
   wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
@@ -131,9 +141,10 @@ echo ""
 echo "NEXT STEPS:"
 echo "1. Log into the LXC console in Proxmox (User: root)."
 echo "2. Run: vncserver"
-echo "3. Select [1] to create a new user with write access."
-echo "4. Create your desired username and password."
-echo "5. Select [1] (Manually edit xstartup) for the Desktop Environment."
+echo "3. Press 'y' to accept the EULA."
+echo "4. Select [1] to create a new user with write access."
+echo "5. Create your desired username and password."
+echo "6. Select [1] (Manually edit xstartup) for the Desktop Environment."
 echo "   (Just press Ctrl+X to exit the editor, the config is already there)."
 echo ""
 echo "Once done, access your browser at: https://${LXC_IP}:8444"

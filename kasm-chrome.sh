@@ -3,7 +3,7 @@
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-chrome.sh)"
 # Features: AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
 
-echo "=== Kasm-Chrome LXC Provisioning Script (Version 8) ==="
+echo "=== Kasm-Chrome LXC Provisioning Script (Version 9) ==="
 
 # Pre-flight check for jq dependency on host
 which jq >/dev/null || { echo "Installing jq on host..."; apt update && apt install -y jq; }
@@ -102,10 +102,30 @@ systemctl enable kasmvnc
 EOF
 
 # 4. Create Container
-pveam update
+echo "[i] Updating appliance templates..."
+pveam update >/dev/null 2>&1
 TEMPLATE=$(pveam available | grep -m 1 'ubuntu-24.04-standard' | awk '{print $2}')
-pveam download local $TEMPLATE
-pct create $CTID local:vztmpl/${TEMPLATE##*/} --ostype ubuntu --hostname $CTNAME --net0 $NET_CONFIG --storage $STORAGE --rootfs $STORAGE:$DISK_SIZE --password $PASSWORD --memory 2048 --cores 2 --features $UNPRIV_FLAG
+
+# Failsafe in case the template string is empty
+if [ -z "$TEMPLATE" ]; then
+    echo "[!] Error: Could not find the Ubuntu 24.04 template."
+    echo "    Try running 'pveam update' manually on your host."
+    exit 1
+fi
+
+pveam download local "$TEMPLATE"
+
+pct create "$CTID" "local:vztmpl/${TEMPLATE##*/}" \
+    --ostype ubuntu \
+    --arch amd64 \
+    --hostname "$CTNAME" \
+    --net0 "$NET_CONFIG" \
+    --storage "$STORAGE" \
+    --rootfs "$STORAGE:$DISK_SIZE" \
+    --password "$PASSWORD" \
+    --memory 2048 \
+    --cores 2 \
+    $UNPRIV_FLAG
 
 # 5. Apply AppArmor & GPU Configs
 echo "lxc.apparmor.profile: unconfined" >> /etc/pve/lxc/$CTID.conf
@@ -119,18 +139,18 @@ EOF
 fi
 
 # 6. Execute Provisioning
-pct start $CTID
+pct start "$CTID"
 sleep 15 
-pct exec $CTID -- mkdir -p /root/.vnc
-pct push $CTID /tmp/xstartup /root/.vnc/xstartup
-pct push $CTID /tmp/kasmvnc.service /etc/systemd/system/kasmvnc.service
-pct push $CTID /tmp/provision.sh /tmp/provision.sh
+pct exec "$CTID" -- mkdir -p /root/.vnc
+pct push "$CTID" /tmp/xstartup /root/.vnc/xstartup
+pct push "$CTID" /tmp/kasmvnc.service /etc/systemd/system/kasmvnc.service
+pct push "$CTID" /tmp/provision.sh /tmp/provision.sh
 
-pct exec $CTID -- bash /tmp/provision.sh
+pct exec "$CTID" -- bash /tmp/provision.sh
 
 # Cleanup host temp files
 rm /tmp/xstartup /tmp/kasmvnc.service /tmp/provision.sh
-pct exec $CTID -- rm /tmp/provision.sh
+pct exec "$CTID" -- rm /tmp/provision.sh
 
 echo -e "\n========================================="
 echo "✅ Provisioning Complete!"

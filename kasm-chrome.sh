@@ -1,6 +1,7 @@
 #!/bin/bash
 # Proxmox Host Script: Create Kasm-Chrome LXC (Ubuntu 24.04) 
-# Features: Nesting, AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
+# Usage: bash -c "$(curl -fsSL https://github.com/jereloh/pmox_scripts/blob/main/kasm-chrome.sh)"
+# Features: AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
 
 echo "=== Kasm-Chrome LXC Provisioning Script (Version 8) ==="
 
@@ -104,7 +105,7 @@ EOF
 pveam update
 TEMPLATE=$(pveam available | grep -m 1 'ubuntu-24.04-standard' | awk '{print $2}')
 pveam download local $TEMPLATE
-pct create $CTID local:vztmpl/${TEMPLATE##*/} --ostype ubuntu --hostname $CTNAME --net0 $NET_CONFIG --storage $STORAGE --rootfs $STORAGE:$DISK_SIZE --password $PASSWORD --memory 2048 --cores 2 --features nesting=1 $UNPRIV_FLAG
+pct create $CTID local:vztmpl/${TEMPLATE##*/} --ostype ubuntu --hostname $CTNAME --net0 $NET_CONFIG --storage $STORAGE --rootfs $STORAGE:$DISK_SIZE --password $PASSWORD --memory 2048 --cores 2 --features $UNPRIV_FLAG
 
 # 5. Apply AppArmor & GPU Configs
 echo "lxc.apparmor.profile: unconfined" >> /etc/pve/lxc/$CTID.conf

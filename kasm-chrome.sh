@@ -2,7 +2,7 @@
 # Proxmox Host Script: Create Kasm-Chrome LXC (Ubuntu 24.04) 
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-chrome.sh)"
 # Features: AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
-echo "=== Kasm-Chrome LXC Provisioning Script (Version 13) ==="
+echo "=== Kasm-Chrome LXC Provisioning Script (Version Final) ==="
 
 # Pre-flight check for jq dependency on host
 which jq >/dev/null || { echo "Installing jq on host..."; apt update && apt install -y jq; }
@@ -193,6 +193,6 @@ else
 fi
 echo "-----------------------------------------"
 echo "1. Run: 'pct enter $CTID'"
-echo "2. Run: 'vncserver' (Perform one-time setup)"
+echo "2. Run: 'vncpasswd -u <your_username> -r -w' (Set your login details)"
 echo "3. Run: 'systemctl start kasmvnc'"
 echo "========================================="

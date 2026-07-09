@@ -2,7 +2,7 @@
 # Proxmox Host Script: Create Kasm-Chrome LXC (Ubuntu 24.04) 
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-chrome.sh)"
 # Features: AppArmor Bypass, Auto-Restart, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough
-echo "=== Kasm-Chrome LXC Provisioning Script (Version 10) ==="
+echo "=== Kasm-Chrome LXC Provisioning Script (Version 13) ==="
 
 # Pre-flight check for jq dependency on host
 which jq >/dev/null || { echo "Installing jq on host..."; apt update && apt install -y jq; }
@@ -25,21 +25,36 @@ else NET_CONFIG="name=eth0,bridge=vmbr0,ip=dhcp"; fi
 # Optional Cloudflared Token
 read -p "Enter Cloudflare Tunnel Token (Leave blank to skip): " CF_TOKEN
 
-# 2. Interactive iGPU Passthrough Request
+# 2. Interactive iGPU Passthrough Request (Always asks + Targeted Host Enabler)
 HAS_GPU=0
-if [ -c "/dev/dri/renderD128" ]; then
-    read -p "Intel iGPU detected! Do you want to pass it through to this LXC? [y/n] [y]: " WANT_GPU
-    WANT_GPU=${WANT_GPU:-y}
-    if [[ "$WANT_GPU" =~ ^[Yy]$ ]]; then
-        HAS_GPU=1
-        echo "[+] Enabling hardware passthrough configurations."
+echo -e "\n--- Hardware Acceleration ---"
+read -p "Do you want to enable iGPU passthrough to this LXC? [y/n] [n]: " WANT_GPU
+WANT_GPU=${WANT_GPU:-n}
+
+if [[ "$WANT_GPU" =~ ^[Yy]$ ]]; then
+    HAS_GPU=1
+    echo "[+] Enabling hardware passthrough configurations."
+    
+    # Check specifically for the render node, attempt to load drivers if missing
+    if [ ! -c "/dev/dri/renderD128" ]; then
+        echo "[i] /dev/dri/renderD128 not found on host. Attempting to force-load Intel iGPU modules..."
+        modprobe i915 2>/dev/null
+        sleep 3
+    fi
+    
+    # Verify if loading the driver worked and apply permissions
+    if [ ! -c "/dev/dri/renderD128" ]; then
+        echo "[!] WARNING: /dev/dri/renderD128 still not found on the Proxmox host."
+        echo "    The LXC will be configured for passthrough, but you likely need to"
+        echo "    enable the iGPU in your motherboard BIOS or check host kernel modules."
+    else
+        echo "[i] Host iGPU rendering node detected successfully. Applying permissions..."
         chmod 666 /dev/dri/card0 2>/dev/null || true
         chmod 666 /dev/dri/renderD128 2>/dev/null || true
-        CHROME_FLAGS="--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --enable-features=VaapiVideoDecoder"
     fi
-fi
 
-if [ "$HAS_GPU" -eq 0 ]; then
+    CHROME_FLAGS="--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --enable-features=VaapiVideoDecoder"
+else
     echo "[!] Defaulting to software rendering."
     CHROME_FLAGS="--disable-gpu"
 fi

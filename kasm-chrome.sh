@@ -1,4 +1,5 @@
 #!/bin/bash
+# [Deprecated - script no longer will be maintained in favor of kasm-ff.sh]
 # Proxmox Host Script: Create Kasm-Chrome LXC (Ubuntu 24.04) 
 # Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-chrome.sh)"
 # Features: Lightweight Desktop, Systemd, Dynamic KasmVNC, Optional iGPU Passthrough, Tint2 Taskbar, Right-Click Menu

@@ -116,6 +116,21 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# Build KasmVNC YAML Config (Always includes dynamic resizing, injects GPU if selected)
+cat << 'EOF' > /tmp/kasmvnc.yaml
+desktop:
+  allow_resize: true
+  pixel_depth: 24
+EOF
+
+if [ "$HAS_GPU" -eq 1 ]; then
+    cat << 'EOF' >> /tmp/kasmvnc.yaml
+  gpu:
+    hw3d: true
+    drinode: /dev/dri/renderD128
+EOF
+fi
+
 cat << 'EOF' > /tmp/provision.sh
 #!/bin/bash
 chmod +x /root/.vnc/xstartup
@@ -199,18 +214,20 @@ sleep 15
 # Directories
 pct exec "$CTID" -- mkdir -p /root/.vnc
 pct exec "$CTID" -- mkdir -p /root/.config/openbox
+pct exec "$CTID" -- mkdir -p /etc/kasmvnc
 
 # Push configs
 pct push "$CTID" /tmp/xstartup /root/.vnc/xstartup
 pct push "$CTID" /tmp/menu.xml /root/.config/openbox/menu.xml
 pct push "$CTID" /tmp/kasmvnc.service /etc/systemd/system/kasmvnc.service
+pct push "$CTID" /tmp/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 pct push "$CTID" /tmp/provision.sh /tmp/provision.sh
 
 # Run installer
 pct exec "$CTID" -- bash /tmp/provision.sh
 
 # Cleanup host temp files
-rm /tmp/xstartup /tmp/menu.xml /tmp/kasmvnc.service /tmp/provision.sh
+rm /tmp/xstartup /tmp/menu.xml /tmp/kasmvnc.service /tmp/kasmvnc.yaml /tmp/provision.sh
 pct exec "$CTID" -- rm /tmp/provision.sh
 
 echo -e "\n========================================="

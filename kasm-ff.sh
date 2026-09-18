@@ -3,11 +3,11 @@
 # Proxmox host script: browser-accessible Firefox + shell in an Ubuntu 24.04 LXC.
 #
 #   KasmVNC  (https://<ip>:8444)  -> Openbox desktop + Firefox
-#   ttyd     (https://<ip>:7681)  -> real terminal in a browser tab, tmux-backed
 #
-# Both listeners are TLS-only (snakeoil cert). The https:// scheme is required:
+# The listener is TLS-only (snakeoil cert). The https:// scheme is required:
 # plain http:// gets the connection closed with no response.
 # Default login user is 'kasm' (override with KASM_USER).
+# Shell access is via `pct enter <ctid>` from the Proxmox host.
 #
 # Fully non-interactive install: no `vncserver` setup wizard afterwards.
 #
@@ -181,9 +181,16 @@ ask TIMEZONE "Timezone" "$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
 
 echo
 echo "--- Credentials ---"
+ask KASM_USER "Username for the web desktop and terminal" "kasm"
+[[ "$KASM_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+  || die "Username must be lowercase, start with a letter or underscore, and be 1-32 chars."
+case "$KASM_USER" in
+  root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|nobody|systemd-*|ubuntu)
+    die "'$KASM_USER' is a reserved system account. Pick another name." ;;
+esac
+
 ask_secret CT_PASSWORD   "Root password for the container" 8
-ask_secret KASM_PASSWORD "Web password for Firefox + terminal (user: ${KASM_USER:-kasm})" 8
-KASM_USER="${KASM_USER:-kasm}"
+ask_secret KASM_PASSWORD "Web password for ${KASM_USER}" 8
 
 echo
 echo "--- Hardware acceleration ---"
@@ -218,7 +225,6 @@ ask AUTOSTART_FIREFOX "Launch Firefox automatically on session start? [y/n]" "y"
 ask UI_SCALE "Desktop UI scale (1.0 = native, 1.25 helps on phones)" "1.25"
 
 KASM_PORT="${KASM_PORT:-8444}"
-TTYD_PORT="${TTYD_PORT:-7681}"
 
 echo
 echo "--------------------------------------------------"
@@ -228,6 +234,7 @@ printf '  Unprivileged: %s   GPU: %s   Firewall: %s\n' \
   "$([[ $UNPRIV_FLAG == 1 ]] && echo yes || echo no)" \
   "$([[ $HAS_GPU == 1 ]] && echo yes || echo no)" \
   "${ALLOW_CIDR:-none}"
+printf '  Web login: %s   Desktop port: %s\n' "$KASM_USER" "$KASM_PORT"
 echo "--------------------------------------------------"
 if [[ "${ASSUME_YES:-0}" != "1" ]]; then
   read -r -p "Proceed? [Y/n]: " go; [[ "${go:-y}" =~ ^[Yy]$ ]] || die "Aborted."
@@ -334,7 +341,6 @@ cat > "${HOST_TMP}/provision.env" <<ENVEOF
 KASM_USER='${KASM_USER}'
 KASM_PASSWORD='${KASM_PASSWORD//\'/\'\\\'\'}'
 KASM_PORT='${KASM_PORT}'
-TTYD_PORT='${TTYD_PORT}'
 HAS_GPU='${HAS_GPU}'
 TIMEZONE='${TIMEZONE}'
 UI_SCALE='${UI_SCALE}'
@@ -650,18 +656,6 @@ pref("mousewheel.default.delta_multiplier_y", 200);
 pref("gfx.webrender.all", true);
 PREFEOF
 
-step "ttyd (browser terminal)"
-if ! apt-get "${APT_OPTS[@]}" install ttyd 2>/dev/null; then
-  echo "[i] ttyd not in the archive; fetching the static build."
-  TTYD_URL="$(curl -fsSL --max-time 20 https://api.github.com/repos/tsl0922/ttyd/releases/latest 2>/dev/null \
-    | jq -r '.assets[]?.browser_download_url | select(endswith("ttyd.x86_64"))' | head -1)"
-  [[ -n "$TTYD_URL" && "$TTYD_URL" != "null" ]] \
-    || TTYD_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
-  retry 3 wget -q -O /usr/local/bin/ttyd "$TTYD_URL"
-  chmod 0755 /usr/local/bin/ttyd
-fi
-TTYD_BIN="$(command -v ttyd)"
-
 step "systemd services"
 cat > /etc/systemd/system/kasmvnc.service <<UNITEOF
 [Unit]
@@ -693,36 +687,6 @@ TimeoutStartSec=60
 WantedBy=multi-user.target
 UNITEOF
 
-cat > /etc/systemd/system/ttyd.service <<UNITEOF
-[Unit]
-Description=ttyd browser terminal for ${KASM_USER}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=${KASM_USER}
-Group=${KASM_USER}
-WorkingDirectory=${HOMEDIR}
-Environment=HOME=${HOMEDIR}
-Environment=TERM=xterm-256color
-EnvironmentFile=/etc/ttyd.env
-ExecStart=${TTYD_BIN} --port ${TTYD_PORT} --writable \\
-  --credential \${TTYD_CRED} \\
-  --ssl --ssl-cert /etc/ssl/certs/ssl-cert-snakeoil.pem \\
-  --ssl-key /etc/ssl/private/ssl-cert-snakeoil.key \\
-  -t fontSize=16 -t 'theme={"background":"#1d2021"}' \\
-  tmux new -A -s main
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-UNITEOF
-
-printf 'TTYD_CRED=%s:%s\n' "$KASM_USER" "$KASM_PASSWORD" > /etc/ttyd.env
-chmod 640 /etc/ttyd.env
-chgrp "$KASM_USER" /etc/ttyd.env
-
 cat > "${HOMEDIR}/.tmux.conf" <<'TMUXEOF'
 set -g mouse on
 set -g history-limit 20000
@@ -733,7 +697,6 @@ chown "$KASM_USER:$KASM_USER" "${HOMEDIR}/.tmux.conf"
 
 systemctl daemon-reload
 systemctl enable --now kasmvnc.service
-systemctl enable --now ttyd.service
 
 step "Optional extras"
 if [[ -n "$ALLOW_CIDR" ]]; then
@@ -742,7 +705,6 @@ if [[ -n "$ALLOW_CIDR" ]]; then
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
   ufw allow from "$ALLOW_CIDR" to any port "$KASM_PORT" proto tcp >/dev/null
-  ufw allow from "$ALLOW_CIDR" to any port "$TTYD_PORT" proto tcp >/dev/null
   ufw allow from "$ALLOW_CIDR" to any port 22 proto tcp >/dev/null
   ufw --force enable >/dev/null
   echo "[+] ufw active, web ports limited to ${ALLOW_CIDR}."
@@ -764,7 +726,7 @@ apt-get clean
 step "Health check"
 sleep 6
 FAILED=0
-for svc in kasmvnc ttyd; do
+for svc in kasmvnc; do
   if systemctl is-active --quiet "$svc"; then
     echo "[✓] ${svc}.service active"
   else
@@ -808,7 +770,7 @@ else
 fi
 echo "--------------------------------------------------------"
 printf '  Desktop + Firefox : https://%s:%s\n' "$CT_IP" "$KASM_PORT"
-printf '  Terminal          : https://%s:%s\n' "$CT_IP" "$TTYD_PORT"
+printf '  Shell             : pct enter %s  (from the Proxmox host)\n' "$CTID"
 printf '  Login             : %s / (the web password you set)\n' "$KASM_USER"
 echo
 printf '  GPU passthrough   : %s\n' "$([[ $HAS_GPU == 1 ]] && echo enabled || echo 'off (software rendering)')"

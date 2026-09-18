@@ -12,7 +12,7 @@
 # Fully non-interactive install: no `vncserver` setup wizard afterwards.
 #
 # Usage:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/<you>/pmox_scripts/main/kasm-ff.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-ff.sh)"
 #
 # Unattended: set any of the variables in the CONFIG block as environment
 # variables and add ASSUME_YES=1, e.g.

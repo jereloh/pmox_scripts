@@ -12,7 +12,7 @@
 # Fully non-interactive install: no `vncserver` setup wizard afterwards.
 #
 # Usage:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-ff.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/<you>/pmox_scripts/main/kasm-ff.sh)"
 #
 # Unattended: set any of the variables in the CONFIG block as environment
 # variables and add ASSUME_YES=1, e.g.
@@ -173,8 +173,9 @@ else
   NET_CONFIG="name=eth0,bridge=${BRIDGE:-vmbr0},ip=dhcp"
 fi
 
-ask_optional CUSTOM_DNS "DNS server for the container (e.g. 172.16.10.11)"
+ask CUSTOM_DNS "DNS server for the container (or 'none' for host default)" "172.16.0.6"
 CUSTOM_DNS="$(printf '%s' "$CUSTOM_DNS" | tr -d '[:space:]')"
+[[ "$CUSTOM_DNS" == "none" ]] && CUSTOM_DNS=""
 if [[ -n "$CUSTOM_DNS" ]]; then
   for _ns in ${CUSTOM_DNS//,/ }; do
     [[ "$_ns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$_ns" =~ ^[0-9a-fA-F:]+$ ]] \
@@ -182,10 +183,6 @@ if [[ -n "$CUSTOM_DNS" ]]; then
   done
 fi
 DNS_FLAG=(); [[ -n "$CUSTOM_DNS" ]] && DNS_FLAG=(--nameserver "$CUSTOM_DNS")
-
-ask_optional SEARCH_DOMAIN "Search domain for the container (e.g. lab.internal)"
-SEARCH_DOMAIN="$(printf '%s' "$SEARCH_DOMAIN" | tr -d '[:space:]')"
-[[ -n "$SEARCH_DOMAIN" ]] && DNS_FLAG+=(--searchdomain "$SEARCH_DOMAIN")
 
 ask TIMEZONE "Timezone" "$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
 
@@ -229,10 +226,6 @@ CF_TOKEN="$(printf '%s' "$CF_TOKEN" | tr -d '[:space:]')"
 ask_optional ALLOW_CIDR "Restrict web ports to this CIDR with ufw (e.g. 192.168.1.0/24)"
 ALLOW_CIDR="$(printf '%s' "$ALLOW_CIDR" | tr -d '[:space:]')"
 
-# The original working script ran unconfined. Confining it broke networking for
-# the non-root desktop user, so this defaults to the known-good setting.
-ask APPARMOR_UNCONFINED "Run the container AppArmor-unconfined? [y/n]" "y"
-
 ask AUTOSTART_FIREFOX "Launch Firefox automatically on session start? [y/n]" "y"
 ask UI_SCALE "Desktop UI scale (1.0 = native, 1.25 helps on phones)" "1.25"
 
@@ -248,8 +241,7 @@ printf '  Unprivileged: %s   GPU: %s   Firewall: %s\n' \
   "${ALLOW_CIDR:-none}"
 printf '  Web login: %s   Desktop port: %s\n' "$KASM_USER" "$KASM_PORT"
 printf '  Network: %s\n' "$NET_CONFIG"
-printf '  DNS: %s   Search domain: %s\n' \
-  "${CUSTOM_DNS:-inherited from host}" "${SEARCH_DOMAIN:-inherited from host}"
+printf '  DNS: %s\n' "${CUSTOM_DNS:-inherited from host}"
 echo "--------------------------------------------------"
 if [[ "${ASSUME_YES:-0}" != "1" ]]; then
   read -r -p "Proceed? [Y/n]: " go; [[ "${go:-y}" =~ ^[Yy]$ ]] || die "Aborted."
@@ -294,10 +286,15 @@ CT_CREATED=1
 ok "Container created."
 
 CONF="/etc/pve/lxc/${CTID}.conf"
-if [[ "$APPARMOR_UNCONFINED" =~ ^[Yy]$ ]]; then
-  warn "Setting lxc.apparmor.profile: unconfined (weakens container isolation)."
-  echo "lxc.apparmor.profile: unconfined" >> "$CONF"
-fi
+# AppArmor: always unconfined. This is not optional.
+# Under the default LXC AppArmor profile the non-root desktop user loses DNS
+# resolution entirely - root still resolves, so it presents as a Firefox bug
+# and is extremely hard to diagnose. Tested and confirmed on this stack.
+# The trade-off: the container keeps full isolation from the host via its
+# unprivileged user namespace, but loses AppArmor's extra restrictions on
+# mounts and /proc,/sys writes. Acceptable here; do not "harden" this away.
+log "Applying lxc.apparmor.profile: unconfined (required for desktop-user DNS)."
+echo "lxc.apparmor.profile: unconfined" >> "$CONF"
 
 log "Starting container..."
 pct start "$CTID"
@@ -774,9 +771,9 @@ if sudo -u "$KASM_USER" curl -sI --max-time 10 https://example.com >/dev/null 2>
   echo "[✓] ${KASM_USER} has outbound HTTPS"
 else
   echo "[x] ${KASM_USER} has NO outbound HTTPS - Firefox will not load any site." >&2
-  echo "    Fix on the Proxmox host:" >&2
-  echo "      echo 'lxc.apparmor.profile: unconfined' >> /etc/pve/lxc/<CTID>.conf" >&2
-  echo "      pct reboot <CTID>" >&2
+  echo "    The container is already AppArmor-unconfined, so check on the host:" >&2
+  echo "      grep apparmor /etc/pve/lxc/<CTID>.conf   (should say: unconfined)" >&2
+  echo "      then verify routing and the upstream DNS server." >&2
   FAILED=1
 fi
 
@@ -816,11 +813,6 @@ if (( PROV_RC == 0 )); then
 else
   warn "Provisioning finished with errors (exit ${PROV_RC})."
   warn "Inspect with: pct exec ${CTID} -- journalctl -u kasmvnc -n 50 --no-pager"
-  if [[ ! "$APPARMOR_UNCONFINED" =~ ^[Yy]$ ]]; then
-    warn "If KasmVNC will not start, try adding to ${CONF}:"
-    warn "    lxc.apparmor.profile: unconfined"
-    warn "then: pct restart ${CTID}"
-  fi
 fi
 echo "--------------------------------------------------------"
 printf '  Desktop + Firefox : https://%s:%s\n' "$CT_IP" "$KASM_PORT"

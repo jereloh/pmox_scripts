@@ -12,7 +12,7 @@
 # Fully non-interactive install: no `vncserver` setup wizard afterwards.
 #
 # Usage:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/<you>/pmox_scripts/main/kasm-ff.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/kasm-ff.sh)"
 #
 # Unattended: set any of the variables in the CONFIG block as environment
 # variables and add ASSUME_YES=1, e.g.
@@ -173,9 +173,19 @@ else
   NET_CONFIG="name=eth0,bridge=${BRIDGE:-vmbr0},ip=dhcp"
 fi
 
-ask_optional CUSTOM_DNS "Custom DNS server"
+ask_optional CUSTOM_DNS "DNS server for the container (e.g. 172.16.10.11)"
 CUSTOM_DNS="$(printf '%s' "$CUSTOM_DNS" | tr -d '[:space:]')"
+if [[ -n "$CUSTOM_DNS" ]]; then
+  for _ns in ${CUSTOM_DNS//,/ }; do
+    [[ "$_ns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$_ns" =~ ^[0-9a-fA-F:]+$ ]] \
+      || die "'$_ns' is not a valid IP address. Use one or more IPs, comma-separated."
+  done
+fi
 DNS_FLAG=(); [[ -n "$CUSTOM_DNS" ]] && DNS_FLAG=(--nameserver "$CUSTOM_DNS")
+
+ask_optional SEARCH_DOMAIN "Search domain for the container (e.g. lab.internal)"
+SEARCH_DOMAIN="$(printf '%s' "$SEARCH_DOMAIN" | tr -d '[:space:]')"
+[[ -n "$SEARCH_DOMAIN" ]] && DNS_FLAG+=(--searchdomain "$SEARCH_DOMAIN")
 
 ask TIMEZONE "Timezone" "$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
 
@@ -219,7 +229,9 @@ CF_TOKEN="$(printf '%s' "$CF_TOKEN" | tr -d '[:space:]')"
 ask_optional ALLOW_CIDR "Restrict web ports to this CIDR with ufw (e.g. 192.168.1.0/24)"
 ALLOW_CIDR="$(printf '%s' "$ALLOW_CIDR" | tr -d '[:space:]')"
 
-ask APPARMOR_UNCONFINED "Run the container AppArmor-unconfined? [y/n]" "n"
+# The original working script ran unconfined. Confining it broke networking for
+# the non-root desktop user, so this defaults to the known-good setting.
+ask APPARMOR_UNCONFINED "Run the container AppArmor-unconfined? [y/n]" "y"
 
 ask AUTOSTART_FIREFOX "Launch Firefox automatically on session start? [y/n]" "y"
 ask UI_SCALE "Desktop UI scale (1.0 = native, 1.25 helps on phones)" "1.25"
@@ -235,6 +247,9 @@ printf '  Unprivileged: %s   GPU: %s   Firewall: %s\n' \
   "$([[ $HAS_GPU == 1 ]] && echo yes || echo no)" \
   "${ALLOW_CIDR:-none}"
 printf '  Web login: %s   Desktop port: %s\n' "$KASM_USER" "$KASM_PORT"
+printf '  Network: %s\n' "$NET_CONFIG"
+printf '  DNS: %s   Search domain: %s\n' \
+  "${CUSTOM_DNS:-inherited from host}" "${SEARCH_DOMAIN:-inherited from host}"
 echo "--------------------------------------------------"
 if [[ "${ASSUME_YES:-0}" != "1" ]]; then
   read -r -p "Proceed? [Y/n]: " go; [[ "${go:-y}" =~ ^[Yy]$ ]] || die "Aborted."
@@ -296,7 +311,21 @@ for i in $(seq 1 60); do
   fi
   sleep 2
 done
-(( NET_OK )) || die "Container has no working DNS after 120s. Check bridge/DNS settings."
+if (( ! NET_OK )); then
+  warn "Container could not resolve archive.ubuntu.com after 120s."
+  warn "Its /etc/resolv.conf contains:"
+  pct exec "$CTID" -- cat /etc/resolv.conf 2>/dev/null >&2 || true
+  pct exec "$CTID" -- ip -4 addr show dev eth0 2>/dev/null >&2 || true
+  die "Fix DNS/routing and rerun. Provisioning needs outbound access for apt."
+fi
+if [[ -n "$CUSTOM_DNS" ]]; then
+  if pct exec "$CTID" -- grep -q "${CUSTOM_DNS%%,*}" /etc/resolv.conf 2>/dev/null; then
+    ok "Using DNS ${CUSTOM_DNS}."
+  else
+    warn "DNS ${CUSTOM_DNS} was requested but is not in the container's resolv.conf."
+    warn "If the container is on DHCP, the lease may be overriding it."
+  fi
+fi
 CT_IP_EARLY="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)"
 ok "Networking up (${CT_IP_EARLY:-unknown})."
 
@@ -629,6 +658,7 @@ cat > /etc/firefox/policies/policies.json <<'POLEOF'
     "DisableFirefoxStudies": true,
     "DisableProfileImport": true,
     "DontCheckDefaultBrowser": true,
+    "DNSOverHTTPS": { "Enabled": false, "Locked": true },
     "OverrideFirstRunPage": "",
     "OverridePostUpdatePage": "",
     "NoDefaultBookmarks": true,
@@ -654,6 +684,9 @@ pref("browser.tabs.warnOnClose", false);
 pref("general.smoothScroll", true);
 pref("mousewheel.default.delta_multiplier_y", 200);
 pref("gfx.webrender.all", true);
+// Resolve through the system resolver so internal DNS zones work
+pref("network.trr.mode", 5);
+pref("network.dns.disablePrefetch", true);
 PREFEOF
 
 step "systemd services"
@@ -726,6 +759,27 @@ apt-get clean
 step "Health check"
 sleep 6
 FAILED=0
+
+# The desktop user, not root, is what matters - Firefox runs as this user.
+# A confined container can leave root working while the desktop user has no
+# network at all, which looks like a browser bug and is not one.
+echo "[i] Testing network as ${KASM_USER} (the user Firefox runs as):"
+if sudo -u "$KASM_USER" getent hosts example.com >/dev/null 2>&1; then
+  echo "[✓] ${KASM_USER} can resolve DNS"
+else
+  echo "[x] ${KASM_USER} CANNOT resolve DNS (root may still work - that is the trap)" >&2
+  FAILED=1
+fi
+if sudo -u "$KASM_USER" curl -sI --max-time 10 https://example.com >/dev/null 2>&1; then
+  echo "[✓] ${KASM_USER} has outbound HTTPS"
+else
+  echo "[x] ${KASM_USER} has NO outbound HTTPS - Firefox will not load any site." >&2
+  echo "    Fix on the Proxmox host:" >&2
+  echo "      echo 'lxc.apparmor.profile: unconfined' >> /etc/pve/lxc/<CTID>.conf" >&2
+  echo "      pct reboot <CTID>" >&2
+  FAILED=1
+fi
+
 for svc in kasmvnc; do
   if systemctl is-active --quiet "$svc"; then
     echo "[✓] ${svc}.service active"

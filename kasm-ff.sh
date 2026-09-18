@@ -5,6 +5,10 @@
 #   KasmVNC  (https://<ip>:8444)  -> Openbox desktop + Firefox
 #   ttyd     (https://<ip>:7681)  -> real terminal in a browser tab, tmux-backed
 #
+# Both listeners are TLS-only (snakeoil cert). The https:// scheme is required:
+# plain http:// gets the connection closed with no response.
+# Default login user is 'kasm' (override with KASM_USER).
+#
 # Fully non-interactive install: no `vncserver` setup wizard afterwards.
 #
 # Usage:
@@ -573,24 +577,18 @@ if [[ "$AUTOSTART_FIREFOX" =~ ^[Yy]$ ]]; then
   echo '(sleep 2; firefox) &' >> "${HOMEDIR}/.config/openbox/autostart"
 fi
 
-# Openbox: big title bars and thick borders are far easier to hit on a phone.
-cat > "${HOMEDIR}/.config/openbox/rc.xml" <<'RCEOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<openbox_config xmlns="http://openbox.org/3.4/rc">
-  <resistance><strength>10</strength><screen_edge_strength>20</screen_edge_strength></resistance>
-  <focus><focusNew>yes</focusNew><followMouse>no</followMouse></focus>
-  <theme>
-    <name>Clearlooks</name>
-    <titleLayout>NLIMC</titleLayout>
-    <font place="ActiveWindow"><name>sans</name><size>11</size><weight>bold</weight></font>
-    <font place="InactiveWindow"><name>sans</name><size>11</size></font>
-  </theme>
-  <desktops><number>1</number><names><name>Main</name></names></desktops>
-  <applications>
-    <application class="*"><maximized>yes</maximized></application>
-  </applications>
-</openbox_config>
-RCEOF
+# Openbox config: START FROM THE SYSTEM FILE.
+# A hand-written partial rc.xml silently drops ALL mouse and keyboard bindings
+# (Openbox does not merge defaults for <mouse>/<keyboard>), which kills the
+# right-click root menu. Copy the stock file and patch only what we care about.
+if [[ -f /etc/xdg/openbox/rc.xml ]]; then
+  cp /etc/xdg/openbox/rc.xml "${HOMEDIR}/.config/openbox/rc.xml"
+  # Bigger title-bar fonts for touch, and a single desktop.
+  sed -i 's|<size>8</size>|<size>11</size>|g' "${HOMEDIR}/.config/openbox/rc.xml"
+  sed -i 's|<number>4</number>|<number>1</number>|'  "${HOMEDIR}/.config/openbox/rc.xml"
+else
+  echo "[!] /etc/xdg/openbox/rc.xml missing; leaving Openbox on built-in defaults."
+fi
 
 install -d -m 0755 "${HOMEDIR}/.config/tint2"
 cat > "${HOMEDIR}/.config/tint2/tint2rc" <<'TINTEOF'

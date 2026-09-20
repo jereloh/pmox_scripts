@@ -14,7 +14,7 @@
 # Everything else is auto-detected, with optional environment overrides.
 #
 # Example:
-#   curl -fsSL https://raw.githubusercontent.com/<USER>/<REPO>/main/easy-openldap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/easy-openldap.sh | bash
 #
 # Optional overrides:
 #   CTID=123
@@ -79,6 +79,181 @@ domain_to_base_dn() {
     out+="dc=${part}"
   done
   printf '%s' "$out"
+}
+
+
+have_whiptail() {
+  command -v whiptail >/dev/null 2>&1
+}
+
+input_box() {
+  local title="$1" prompt="$2" default="$3"
+  if have_whiptail; then
+    whiptail --title "$title" --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
+  else
+    local ans
+    read -r -p "${prompt} [${default}]: " ans < /dev/tty
+    printf '%s' "${ans:-$default}"
+  fi
+}
+
+yesno_box() {
+  local title="$1" prompt="$2"
+  if have_whiptail; then
+    whiptail --title "$title" --yesno "$prompt" 10 70
+  else
+    local ans
+    read -r -p "${prompt} [Y/n]: " ans < /dev/tty
+    ans="${ans:-Y}"
+    [[ "$ans" =~ ^[Yy]$ ]]
+  fi
+}
+
+radiolist_box() {
+  local title="$1" prompt="$2" current="$3"
+  shift 3
+  local -a choices=("$@")
+
+  if have_whiptail; then
+    local -a args=()
+    local item
+    for item in "${choices[@]}"; do
+      if [[ "$item" == "$current" ]]; then
+        args+=("$item" "" "ON")
+      else
+        args+=("$item" "" "OFF")
+      fi
+    done
+    whiptail --title "$title" --radiolist "$prompt" 20 78 10 "${args[@]}" 3>&1 1>&2 2>&3
+  else
+    local ans
+    echo "$prompt" > /dev/tty
+    printf 'Available: %s\n' "${choices[*]}" > /dev/tty
+    read -r -p "Value [${current}]: " ans < /dev/tty
+    printf '%s' "${ans:-$current}"
+  fi
+}
+
+configure_ct_ui() {
+  next_vmid
+  detect_template_storage
+  detect_rootfs_storage
+
+  if ! have_whiptail; then
+    warn "whiptail is unavailable; falling back to text prompts."
+  fi
+
+  local mode="2"
+  if have_whiptail; then
+    mode="$(
+      whiptail --title "Easy OpenLDAP - LXC Setup" \
+        --menu "Choose container configuration mode" 15 72 4 \
+        "1" "Use recommended defaults" \
+        "2" "Advanced settings" \
+        3>&1 1>&2 2>&3
+    )" || exit 1
+  fi
+
+  if [[ "$mode" == "1" ]]; then
+    CT_HOSTNAME="${CT_HOSTNAME:-openldap}"
+    CT_CORES="${CT_CORES:-1}"
+    CT_MEMORY="${CT_MEMORY:-512}"
+    CT_SWAP="${CT_SWAP:-256}"
+    CT_DISK_GB="${CT_DISK_GB:-8}"
+    CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
+    CT_NET_MODE="${CT_NET_MODE:-dhcp}"
+    CT_ONBOOT="${CT_ONBOOT:-1}"
+  else
+    CTID="$(input_box "Easy OpenLDAP - CTID" "Container ID" "${CTID}")"
+    [[ "$CTID" =~ ^[0-9]+$ ]] || die "Invalid CTID."
+    pct status "$CTID" >/dev/null 2>&1 && die "CTID ${CTID} already exists."
+
+    CT_HOSTNAME="$(input_box "Easy OpenLDAP - Hostname" "Container hostname" "${CT_HOSTNAME:-openldap}")"
+    CT_CORES="$(input_box "Easy OpenLDAP - CPU" "CPU cores" "${CT_CORES:-1}")"
+    CT_MEMORY="$(input_box "Easy OpenLDAP - Memory" "Memory in MB" "${CT_MEMORY:-512}")"
+    CT_SWAP="$(input_box "Easy OpenLDAP - Swap" "Swap in MB" "${CT_SWAP:-256}")"
+    CT_DISK_GB="$(input_box "Easy OpenLDAP - Disk" "Root disk size in GB" "${CT_DISK_GB:-8}")"
+
+    mapfile -t root_stores < <(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+    ((${#root_stores[@]} > 0)) || die "No active rootdir storage found."
+    CT_STORAGE="$(radiolist_box "Easy OpenLDAP - Storage" "Select root filesystem storage" "$CT_STORAGE" "${root_stores[@]}")"
+
+    mapfile -t tmpl_stores < <(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+    ((${#tmpl_stores[@]} > 0)) || die "No active template storage found."
+    TEMPLATE_STORAGE="$(radiolist_box "Easy OpenLDAP - Template Storage" "Select template storage" "$TEMPLATE_STORAGE" "${tmpl_stores[@]}")"
+
+    mapfile -t bridges < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+    ((${#bridges[@]} > 0)) || bridges=("${CT_BRIDGE:-vmbr0}")
+    CT_BRIDGE="$(radiolist_box "Easy OpenLDAP - Bridge" "Select network bridge" "${CT_BRIDGE:-vmbr0}" "${bridges[@]}")"
+
+    if have_whiptail; then
+      CT_NET_MODE="$(
+        whiptail --title "Easy OpenLDAP - IPv4" \
+          --menu "Choose IPv4 configuration" 14 70 3 \
+          "dhcp" "DHCP" \
+          "static" "Static IPv4" \
+          3>&1 1>&2 2>&3
+      )" || exit 1
+    else
+      read -r -p "IPv4 mode [dhcp/static] [dhcp]: " CT_NET_MODE < /dev/tty
+      CT_NET_MODE="${CT_NET_MODE:-dhcp}"
+    fi
+
+    if [[ "$CT_NET_MODE" == "static" ]]; then
+      CT_IPV4="$(input_box "Easy OpenLDAP - Static IP" "IPv4/CIDR, e.g. 172.16.0.20/24" "${CT_IPV4:-}")"
+      CT_GATEWAY="$(input_box "Easy OpenLDAP - Gateway" "IPv4 gateway" "${CT_GATEWAY:-}")"
+      [[ "$CT_IPV4" == */* ]] || die "Static IPv4 must include CIDR."
+      [[ -n "$CT_GATEWAY" ]] || die "Static gateway cannot be empty."
+    fi
+
+    if yesno_box "Easy OpenLDAP - Startup" "Start the LXC automatically when the Proxmox node boots?"; then
+      CT_ONBOOT=1
+    else
+      CT_ONBOOT=0
+    fi
+  fi
+
+  check_bridge
+}
+
+confirm_full_plan() {
+  local net_desc
+  if [[ "${CT_NET_MODE:-dhcp}" == "static" ]]; then
+    net_desc="${CT_IPV4}, gateway ${CT_GATEWAY}"
+  else
+    net_desc="DHCP"
+  fi
+
+  local summary
+  summary="CTID:              ${CTID}
+Hostname:          ${CT_HOSTNAME}
+Debian:            ${DEBIAN_RELEASE}
+CPU cores:         ${CT_CORES}
+Memory:            ${CT_MEMORY} MB
+Swap:              ${CT_SWAP} MB
+Disk:              ${CT_DISK_GB} GB
+Rootfs storage:    ${CT_STORAGE}
+Template storage:  ${TEMPLATE_STORAGE}
+Bridge:            ${CT_BRIDGE}
+IPv4:              ${net_desc}
+Start on boot:     ${CT_ONBOOT:-1}
+
+LDAP domain:       ${LDAP_DOMAIN}
+Base DN:           ${BASE_DN}
+Admin DN:          ${LDAP_ADMIN_DN}"
+
+  if have_whiptail; then
+    whiptail --title "Easy OpenLDAP - Confirm Deployment" \
+      --yesno "$summary
+
+Create the LXC and install OpenLDAP?" 27 82 || exit 0
+  else
+    echo "$summary"
+    local ans
+    read -r -p "Create the LXC and install OpenLDAP? [Y/n]: " ans < /dev/tty
+    ans="${ans:-Y}"
+    [[ "$ans" =~ ^[Yy]$ ]] || exit 0
+  fi
 }
 
 prompt_domain() {
@@ -249,16 +424,23 @@ show_plan() {
 create_lxc() {
   info "Creating Debian LXC ${CTID}..."
 
+  local net0
+  if [[ "${CT_NET_MODE:-dhcp}" == "static" ]]; then
+    net0="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IPV4},gw=${CT_GATEWAY},type=veth"
+  else
+    net0="name=eth0,bridge=${CT_BRIDGE},ip=dhcp,type=veth"
+  fi
+
   pct create "$CTID" "$TEMPLATE_REF" \
     --hostname "$CT_HOSTNAME" \
     --cores "$CT_CORES" \
     --memory "$CT_MEMORY" \
     --swap "$CT_SWAP" \
     --rootfs "${CT_STORAGE}:${CT_DISK_GB}" \
-    --net0 "name=eth0,bridge=${CT_BRIDGE},ip=dhcp,type=veth" \
+    --net0 "$net0" \
     --unprivileged 1 \
     --features nesting=0 \
-    --onboot 1 \
+    --onboot "${CT_ONBOOT:-1}" \
     --start 0
 
   ok "LXC ${CTID} created."
@@ -806,14 +988,15 @@ final_message() {
 main() {
   need_root
   check_pve_host
+
+  configure_ct_ui
+
   prompt_domain
   prompt_password
-  next_vmid
-  detect_template_storage
-  detect_rootfs_storage
-  check_bridge
+
   find_debian_template
-  show_plan
+  confirm_full_plan
+
   create_lxc
   start_lxc
   build_guest_installer

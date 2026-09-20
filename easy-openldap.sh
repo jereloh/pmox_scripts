@@ -79,6 +79,20 @@ check_pve() {
   command -v pveam >/dev/null 2>&1 || die "'pveam' not found."
   command -v pvesm >/dev/null 2>&1 || die "'pvesm' not found."
   command -v pvesh >/dev/null 2>&1 || die "'pvesh' not found."
+
+  case "$(uname -m)" in
+    x86_64)
+      HOST_ARCH="amd64"
+      ;;
+    aarch64|arm64)
+      HOST_ARCH="arm64"
+      ;;
+    *)
+      die "Unsupported Proxmox host architecture: $(uname -m)"
+      ;;
+  esac
+
+  ok "Detected Proxmox host architecture: ${HOST_ARCH}"
 }
 
 ensure_whiptail() {
@@ -444,6 +458,7 @@ Container
   CTID:             ${CTID}
   Hostname:         ${CT_HOSTNAME}
   OS:               Debian ${DEBIAN_RELEASE}
+  Architecture:     ${HOST_ARCH}
   CPU:              ${CT_CORES} core(s)
   RAM:              ${CT_MEMORY} MB
   Swap:             ${CT_SWAP} MB
@@ -489,17 +504,28 @@ find_debian_template() {
   info "Refreshing Proxmox template index..."
   pveam update >/dev/null
 
+  # IMPORTANT: Proxmox may publish both amd64 and arm64 templates.
+  # Never select a template for the wrong CPU architecture: doing so
+  # creates an LXC that fails at /sbin/init with "Exec format error".
   TEMPLATE_NAME="$(
     pveam available --section system 2>/dev/null |
-      awk -v rel="$DEBIAN_RELEASE" '$2 ~ ("debian-" rel "-standard") {print $2}' |
+      awk -v rel="$DEBIAN_RELEASE" -v arch="$HOST_ARCH" '
+        $2 ~ ("debian-" rel "-standard") && $2 ~ ("_" arch "\\.tar") {print $2}
+      ' |
       sort -V |
       tail -1
   )"
 
   [[ -n "$TEMPLATE_NAME" ]] ||
-    die "Unable to find Debian ${DEBIAN_RELEASE} standard template."
+    die "Unable to find a Debian ${DEBIAN_RELEASE} ${HOST_ARCH} standard template."
+
+  case "$TEMPLATE_NAME" in
+    *_"${HOST_ARCH}".tar.*) ;;
+    *) die "Safety check failed: template '${TEMPLATE_NAME}' does not match host architecture '${HOST_ARCH}'." ;;
+  esac
 
   TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}"
+  info "Selected template: ${TEMPLATE_NAME}"
 
   if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null |
        awk 'NR>1 {print $1}' |
@@ -521,6 +547,7 @@ create_lxc() {
   [[ -n "$CT_VLAN" ]] && net+=",tag=${CT_VLAN}"
 
   pct create "$CTID" "$TEMPLATE_REF" \
+    --arch "$HOST_ARCH" \
     --hostname "$CT_HOSTNAME" \
     --cores "$CT_CORES" \
     --memory "$CT_MEMORY" \
@@ -531,7 +558,13 @@ create_lxc() {
     --onboot 1 \
     --start 0
 
-  ok "LXC ${CTID} created."
+  local created_arch
+  created_arch="$(pct config "$CTID" | awk '/^arch:/ {print $2}')"
+  if [[ "$created_arch" != "$HOST_ARCH" ]]; then
+    die "Created LXC architecture is '${created_arch:-unknown}', expected '${HOST_ARCH}'. Refusing to start it."
+  fi
+
+  ok "LXC ${CTID} created with architecture ${created_arch}."
 }
 
 start_lxc() {

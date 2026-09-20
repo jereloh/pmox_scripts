@@ -397,7 +397,7 @@ prompt_ldap_settings() {
 
   while true; do
     val="$(ui_input "LDAP DOMAIN" \
-      "Enter the LDAP naming domain.\n\nExample: lab.sg\n\nThis will become dc=lab,dc=sg" \
+      "Enter the LDAP naming domain.\n\nExample: lab.local\n\nThis will become dc=lab,dc=local" \
       "")" || exit 0
 
     val="${val//[[:space:]]/}"
@@ -408,7 +408,7 @@ prompt_ldap_settings() {
     fi
 
     ui_msg "INVALID LDAP DOMAIN" \
-      "Enter a DNS-style name containing at least two labels.\n\nExample: lab.sg"
+      "Enter a DNS-style name containing at least two labels.\n\nExample: lab.local"
   done
 
   BASE_DN="$(domain_to_base_dn "$LDAP_DOMAIN")"

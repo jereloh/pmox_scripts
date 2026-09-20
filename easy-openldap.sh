@@ -1,314 +1,437 @@
 #!/usr/bin/env bash
 # easy-openldap.sh
 #
-# Proxmox VE helper-style installer:
-#   1. Run this script on the Proxmox VE host.
-#   2. It creates a fresh Debian LXC.
-#   3. It installs native OpenLDAP + phpLDAPadmin inside the LXC.
-#   4. It enables memberOf and validates correct LDAP search-scope behavior.
+# Proxmox VE helper-style installer for:
+#   - Debian LXC
+#   - Native OpenLDAP (slapd)
+#   - phpLDAPadmin
+#   - memberOf overlay
 #
-# Interactive questions:
-#   - LDAP domain (for example: lab.local)
-#   - LDAP administrator password
+# Inspired by the interaction pattern used by the Proxmox VE Community Scripts:
+#   - Default vs Advanced settings
+#   - whiptail TUI
+#   - CTID / hostname / resources / storage / network configuration
+#   - confirmation screen before creation
 #
-# Everything else is auto-detected, with optional environment overrides.
+# Run on the Proxmox VE HOST:
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/easy-openldap.sh)"
 #
-# Example:
-#   curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/easy-openldap.sh | bash
+# Default settings:
+#   OS:           Debian 13
+#   Hostname:     openldap
+#   CPU:          1 core
+#   RAM:          512 MB
+#   Swap:         256 MB
+#   Disk:         8 GB
+#   Network:      DHCP
+#   Bridge:       vmbr0
+#   Unprivileged: yes
 #
-# Optional overrides:
-#   CTID=123
-#   CT_HOSTNAME=openldap
-#   CT_CORES=1
-#   CT_MEMORY=512
-#   CT_SWAP=256
-#   CT_DISK_GB=8
-#   CT_BRIDGE=vmbr0
-#   CT_STORAGE=local-lvm
-#   TEMPLATE_STORAGE=local
-#   DEBIAN_RELEASE=12
+# The LDAP domain and administrator password are always requested.
 #
-# Notes:
-#   - Intended for a fresh OpenLDAP deployment.
-#   - Uses DHCP for the container network.
-#   - Uses an unprivileged LXC.
-#   - Does not save the LDAP administrator password to disk.
+# IMPORTANT:
+# - Intended for a new container.
+# - LDAP administrator password is not saved by this script.
+# - phpLDAPadmin is intended for a trusted management network.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+APP="OpenLDAP"
 SCRIPT_NAME="easy-openldap.sh"
 HOST_LOG="/var/log/easy-openldap.log"
-
-CT_HOSTNAME="${CT_HOSTNAME:-openldap}"
-CT_CORES="${CT_CORES:-1}"
-CT_MEMORY="${CT_MEMORY:-512}"
-CT_SWAP="${CT_SWAP:-256}"
-CT_DISK_GB="${CT_DISK_GB:-8}"
-CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
-DEBIAN_RELEASE="${DEBIAN_RELEASE:-12}"
+BACKTITLE="Easy OpenLDAP - Proxmox VE"
 
 exec > >(tee -a "$HOST_LOG") 2>&1
-trap 'rc=$?; echo; echo "[ERROR] ${SCRIPT_NAME} failed at line ${LINENO} (exit ${rc})." >&2; echo "Host log: ${HOST_LOG}" >&2; exit ${rc}' ERR
+trap 'rc=$?; echo; echo "[ERROR] ${SCRIPT_NAME} failed at line ${LINENO} (exit ${rc})." >&2; echo "Log: ${HOST_LOG}" >&2; exit ${rc}' ERR
 
-info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[ OK ]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+die()  { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
+
+cleanup() {
+  [[ -n "${GUEST_SCRIPT:-}" && -f "${GUEST_SCRIPT:-}" ]] && rm -f "$GUEST_SCRIPT" || true
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Host checks
+# ---------------------------------------------------------------------------
 
 need_root() {
-  [[ ${EUID} -eq 0 ]] || die "Run this script as root on the Proxmox VE host."
+  [[ $EUID -eq 0 ]] || die "Run this script as root on the Proxmox VE host."
 }
 
-check_pve_host() {
-  command -v pct >/dev/null 2>&1 || die "'pct' not found. Run this on a Proxmox VE host."
-  command -v pvesm >/dev/null 2>&1 || die "'pvesm' not found. Run this on a Proxmox VE host."
-  command -v pveam >/dev/null 2>&1 || die "'pveam' not found. Run this on a Proxmox VE host."
-  command -v pvesh >/dev/null 2>&1 || die "'pvesh' not found. Run this on a Proxmox VE host."
-  ok "Proxmox VE host detected."
+check_pve() {
+  command -v pct >/dev/null 2>&1 || die "'pct' not found. This must run on a Proxmox VE host."
+  command -v pveam >/dev/null 2>&1 || die "'pveam' not found."
+  command -v pvesm >/dev/null 2>&1 || die "'pvesm' not found."
+  command -v pvesh >/dev/null 2>&1 || die "'pvesh' not found."
+
+  case "$(uname -m)" in
+    x86_64)
+      HOST_ARCH="amd64"
+      ;;
+    aarch64|arm64)
+      HOST_ARCH="arm64"
+      ;;
+    *)
+      die "Unsupported Proxmox host architecture: $(uname -m)"
+      ;;
+  esac
+
+  ok "Detected Proxmox host architecture: ${HOST_ARCH}"
+}
+
+ensure_whiptail() {
+  if ! command -v whiptail >/dev/null 2>&1; then
+    info "Installing whiptail..."
+    apt-get update -qq
+    apt-get install -y whiptail >/dev/null
+  fi
+}
+
+next_ctid() {
+  pvesh get /cluster/nextid 2>/dev/null
+}
+
+ctid_in_use() {
+  pct status "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# TUI helpers
+# ---------------------------------------------------------------------------
+
+ui_msg() {
+  whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 12 70
+}
+
+ui_input() {
+  local title="$1"
+  local prompt="$2"
+  local default="${3:-}"
+  whiptail --backtitle "$BACKTITLE" --title "$title" \
+    --inputbox "$prompt" 10 68 "$default" \
+    3>&1 1>&2 2>&3
+}
+
+ui_password() {
+  local title="$1"
+  local prompt="$2"
+  whiptail --backtitle "$BACKTITLE" --title "$title" \
+    --passwordbox "$prompt" 10 68 \
+    3>&1 1>&2 2>&3
+}
+
+ui_yesno() {
+  local title="$1"
+  local prompt="$2"
+  whiptail --backtitle "$BACKTITLE" --title "$title" \
+    --yesno "$prompt" 12 70
+}
+
+ui_menu() {
+  local title="$1"
+  local prompt="$2"
+  shift 2
+  whiptail --backtitle "$BACKTITLE" --title "$title" \
+    --menu "$prompt" 18 74 10 "$@" \
+    3>&1 1>&2 2>&3
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+validate_hostname() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$|^[A-Za-z0-9]$ ]]
+}
+
+validate_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 ))
+}
+
+validate_domain() {
+  local d="$1" part
+  [[ "$d" == *.* ]] || return 1
+  IFS='.' read -r -a _parts <<< "$d"
+  for part in "${_parts[@]}"; do
+    [[ "$part" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || return 1
+  done
 }
 
 domain_to_base_dn() {
-  local domain="$1" part out=""
-  IFS='.' read -r -a parts <<< "$domain"
-  ((${#parts[@]} >= 2)) || return 1
-
-  for part in "${parts[@]}"; do
-    [[ "$part" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || return 1
+  local d="$1" part out=""
+  IFS='.' read -r -a _parts <<< "$d"
+  for part in "${_parts[@]}"; do
     [[ -n "$out" ]] && out+=","
     out+="dc=${part}"
   done
   printf '%s' "$out"
 }
 
+# ---------------------------------------------------------------------------
+# Storage / bridge discovery
+# ---------------------------------------------------------------------------
 
-have_whiptail() {
-  command -v whiptail >/dev/null 2>&1
+list_template_storages() {
+  pvesm status --content vztmpl 2>/dev/null |
+    awk 'NR>1 && $3=="active" {print $1}'
 }
 
-input_box() {
-  local title="$1" prompt="$2" default="$3"
-  if have_whiptail; then
-    whiptail --title "$title" --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
-  else
-    local ans
-    read -r -p "${prompt} [${default}]: " ans < /dev/tty
-    printf '%s' "${ans:-$default}"
-  fi
+list_rootfs_storages() {
+  pvesm status --content rootdir 2>/dev/null |
+    awk 'NR>1 && $3=="active" {print $1}'
 }
 
-yesno_box() {
-  local title="$1" prompt="$2"
-  if have_whiptail; then
-    whiptail --title "$title" --yesno "$prompt" 10 70
-  else
-    local ans
-    read -r -p "${prompt} [Y/n]: " ans < /dev/tty
-    ans="${ans:-Y}"
-    [[ "$ans" =~ ^[Yy]$ ]]
-  fi
+list_bridges() {
+  ip -o link show |
+    awk -F': ' '$2 ~ /^vmbr[0-9]+(@|$)/ {sub(/@.*/,"",$2); print $2}' |
+    sort -u
 }
 
-radiolist_box() {
-  local title="$1" prompt="$2" current="$3"
-  shift 3
-  local -a choices=("$@")
+choose_storage_menu() {
+  local type="$1"
+  local default="$2"
+  local -a items=()
+  local s
 
-  if have_whiptail; then
-    local -a args=()
-    local item
-    for item in "${choices[@]}"; do
-      if [[ "$item" == "$current" ]]; then
-        args+=("$item" "" "ON")
-      else
-        args+=("$item" "" "OFF")
-      fi
-    done
-    whiptail --title "$title" --radiolist "$prompt" 20 78 10 "${args[@]}" 3>&1 1>&2 2>&3
+  if [[ "$type" == "template" ]]; then
+    while read -r s; do
+      [[ -n "$s" ]] && items+=("$s" "Template storage")
+    done < <(list_template_storages)
   else
-    local ans
-    echo "$prompt" > /dev/tty
-    printf 'Available: %s\n' "${choices[*]}" > /dev/tty
-    read -r -p "Value [${current}]: " ans < /dev/tty
-    printf '%s' "${ans:-$current}"
+    while read -r s; do
+      [[ -n "$s" ]] && items+=("$s" "Container rootfs storage")
+    done < <(list_rootfs_storages)
   fi
+
+  ((${#items[@]} > 0)) || die "No suitable Proxmox storage found."
+
+  if [[ ${#items[@]} -eq 2 ]]; then
+    printf '%s' "${items[0]}"
+    return
+  fi
+
+  ui_menu "STORAGE" "Select ${type} storage" "${items[@]}"
 }
 
-configure_ct_ui() {
-  next_vmid
-  detect_template_storage
-  detect_rootfs_storage
+choose_bridge_menu() {
+  local -a items=()
+  local b
+  while read -r b; do
+    [[ -n "$b" ]] && items+=("$b" "Linux bridge")
+  done < <(list_bridges)
 
-  if ! have_whiptail; then
-    warn "whiptail is unavailable; falling back to text prompts."
+  ((${#items[@]} > 0)) || die "No vmbr bridge found."
+
+  if [[ ${#items[@]} -eq 2 ]]; then
+    printf '%s' "${items[0]}"
+    return
   fi
 
-  local mode="2"
-  if have_whiptail; then
-    mode="$(
-      whiptail --title "Easy OpenLDAP - LXC Setup" \
-        --menu "Choose container configuration mode" 15 72 4 \
-        "1" "Use recommended defaults" \
-        "2" "Advanced settings" \
-        3>&1 1>&2 2>&3
-    )" || exit 1
-  fi
-
-  if [[ "$mode" == "1" ]]; then
-    CT_HOSTNAME="${CT_HOSTNAME:-openldap}"
-    CT_CORES="${CT_CORES:-1}"
-    CT_MEMORY="${CT_MEMORY:-512}"
-    CT_SWAP="${CT_SWAP:-256}"
-    CT_DISK_GB="${CT_DISK_GB:-8}"
-    CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
-    CT_NET_MODE="${CT_NET_MODE:-dhcp}"
-    CT_ONBOOT="${CT_ONBOOT:-1}"
-  else
-    CTID="$(input_box "Easy OpenLDAP - CTID" "Container ID" "${CTID}")"
-    [[ "$CTID" =~ ^[0-9]+$ ]] || die "Invalid CTID."
-    pct status "$CTID" >/dev/null 2>&1 && die "CTID ${CTID} already exists."
-
-    CT_HOSTNAME="$(input_box "Easy OpenLDAP - Hostname" "Container hostname" "${CT_HOSTNAME:-openldap}")"
-    CT_CORES="$(input_box "Easy OpenLDAP - CPU" "CPU cores" "${CT_CORES:-1}")"
-    CT_MEMORY="$(input_box "Easy OpenLDAP - Memory" "Memory in MB" "${CT_MEMORY:-512}")"
-    CT_SWAP="$(input_box "Easy OpenLDAP - Swap" "Swap in MB" "${CT_SWAP:-256}")"
-    CT_DISK_GB="$(input_box "Easy OpenLDAP - Disk" "Root disk size in GB" "${CT_DISK_GB:-8}")"
-
-    mapfile -t root_stores < <(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
-    ((${#root_stores[@]} > 0)) || die "No active rootdir storage found."
-    CT_STORAGE="$(radiolist_box "Easy OpenLDAP - Storage" "Select root filesystem storage" "$CT_STORAGE" "${root_stores[@]}")"
-
-    mapfile -t tmpl_stores < <(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
-    ((${#tmpl_stores[@]} > 0)) || die "No active template storage found."
-    TEMPLATE_STORAGE="$(radiolist_box "Easy OpenLDAP - Template Storage" "Select template storage" "$TEMPLATE_STORAGE" "${tmpl_stores[@]}")"
-
-    mapfile -t bridges < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
-    ((${#bridges[@]} > 0)) || bridges=("${CT_BRIDGE:-vmbr0}")
-    CT_BRIDGE="$(radiolist_box "Easy OpenLDAP - Bridge" "Select network bridge" "${CT_BRIDGE:-vmbr0}" "${bridges[@]}")"
-
-    if have_whiptail; then
-      CT_NET_MODE="$(
-        whiptail --title "Easy OpenLDAP - IPv4" \
-          --menu "Choose IPv4 configuration" 14 70 3 \
-          "dhcp" "DHCP" \
-          "static" "Static IPv4" \
-          3>&1 1>&2 2>&3
-      )" || exit 1
-    else
-      read -r -p "IPv4 mode [dhcp/static] [dhcp]: " CT_NET_MODE < /dev/tty
-      CT_NET_MODE="${CT_NET_MODE:-dhcp}"
-    fi
-
-    if [[ "$CT_NET_MODE" == "static" ]]; then
-      CT_IPV4="$(input_box "Easy OpenLDAP - Static IP" "IPv4/CIDR, e.g. 172.16.0.20/24" "${CT_IPV4:-}")"
-      CT_GATEWAY="$(input_box "Easy OpenLDAP - Gateway" "IPv4 gateway" "${CT_GATEWAY:-}")"
-      [[ "$CT_IPV4" == */* ]] || die "Static IPv4 must include CIDR."
-      [[ -n "$CT_GATEWAY" ]] || die "Static gateway cannot be empty."
-    fi
-
-    if yesno_box "Easy OpenLDAP - Startup" "Start the LXC automatically when the Proxmox node boots?"; then
-      CT_ONBOOT=1
-    else
-      CT_ONBOOT=0
-    fi
-  fi
-
-  check_bridge
+  ui_menu "NETWORK BRIDGE" "Select bridge" "${items[@]}"
 }
 
-confirm_full_plan() {
-  local net_desc
-  if [[ "${CT_NET_MODE:-dhcp}" == "static" ]]; then
-    net_desc="${CT_IPV4}, gateway ${CT_GATEWAY}"
-  else
-    net_desc="DHCP"
-  fi
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 
-  local summary
-  summary="CTID:              ${CTID}
-Hostname:          ${CT_HOSTNAME}
-Debian:            ${DEBIAN_RELEASE}
-CPU cores:         ${CT_CORES}
-Memory:            ${CT_MEMORY} MB
-Swap:              ${CT_SWAP} MB
-Disk:              ${CT_DISK_GB} GB
-Rootfs storage:    ${CT_STORAGE}
-Template storage:  ${TEMPLATE_STORAGE}
-Bridge:            ${CT_BRIDGE}
-IPv4:              ${net_desc}
-Start on boot:     ${CT_ONBOOT:-1}
+default_settings() {
+  METHOD="Default"
+  CTID="$(next_ctid)"
+  CT_HOSTNAME="openldap"
+  DEBIAN_RELEASE="13"
+  CT_CORES="1"
+  CT_MEMORY="512"
+  CT_SWAP="256"
+  CT_DISK_GB="8"
+  CT_UNPRIVILEGED="1"
+  CT_NET_MODE="dhcp"
+  CT_IPV4="dhcp"
+  CT_GATEWAY=""
+  CT_VLAN=""
+  CT_BRIDGE="$(list_bridges | grep -Fx 'vmbr0' | head -1 || true)"
+  [[ -n "$CT_BRIDGE" ]] || CT_BRIDGE="$(list_bridges | head -1)"
+  TEMPLATE_STORAGE="$(list_template_storages | head -1)"
+  CT_STORAGE="$(list_rootfs_storages | head -1)"
 
-LDAP domain:       ${LDAP_DOMAIN}
-Base DN:           ${BASE_DN}
-Admin DN:          ${LDAP_ADMIN_DN}"
-
-  if have_whiptail; then
-    whiptail --title "Easy OpenLDAP - Confirm Deployment" \
-      --yesno "$summary
-
-Create the LXC and install OpenLDAP?" 27 82 || exit 0
-  else
-    echo "$summary"
-    local ans
-    read -r -p "Create the LXC and install OpenLDAP? [Y/n]: " ans < /dev/tty
-    ans="${ans:-Y}"
-    [[ "$ans" =~ ^[Yy]$ ]] || exit 0
-  fi
+  [[ -n "$CT_BRIDGE" ]] || die "No Proxmox bridge found."
+  [[ -n "$TEMPLATE_STORAGE" ]] || die "No template storage found."
+  [[ -n "$CT_STORAGE" ]] || die "No rootfs storage found."
 }
 
-prompt_domain() {
-  local tty=/dev/tty
-  [[ -r "$tty" && -w "$tty" ]] || die "Interactive TTY unavailable."
+advanced_settings() {
+  METHOD="Advanced"
 
-  echo
+  local val
+
   while true; do
-    read -r -p "Enter LDAP domain (example: lab.local): " LDAP_DOMAIN < "$tty"
-    LDAP_DOMAIN="${LDAP_DOMAIN//[[:space:]]/}"
-    [[ -n "$LDAP_DOMAIN" ]] || {
-      echo "LDAP domain cannot be empty." > "$tty"
+    val="$(ui_input "CONTAINER ID" "Set Container ID" "$(next_ctid)")" || exit 0
+    [[ -z "$val" ]] && val="$(next_ctid)"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+      ui_msg "INVALID VALUE" "Container ID must be numeric."
       continue
-    }
-
-    if BASE_DN="$(domain_to_base_dn "$LDAP_DOMAIN")"; then
-      break
     fi
-    echo "Invalid domain. Example: lab.local" > "$tty"
+    if ctid_in_use "$val"; then
+      ui_msg "ID IN USE" "CTID ${val} is already in use."
+      continue
+    fi
+    CTID="$val"
+    break
   done
 
+  while true; do
+    val="$(ui_input "HOSTNAME" "Set container hostname" "openldap")" || exit 0
+    if validate_hostname "$val"; then
+      CT_HOSTNAME="$val"
+      break
+    fi
+    ui_msg "INVALID HOSTNAME" "Enter a valid hostname, for example: openldap"
+  done
+
+  DEBIAN_RELEASE="$(
+    ui_menu "DEBIAN VERSION" "Select Debian release" \
+      "13" "Debian 13" \
+      "12" "Debian 12"
+  )" || exit 0
+
+  while true; do
+    val="$(ui_input "CPU CORES" "Number of CPU cores" "1")" || exit 0
+    if validate_uint "$val"; then CT_CORES="$val"; break; fi
+    ui_msg "INVALID VALUE" "CPU cores must be a positive integer."
+  done
+
+  while true; do
+    val="$(ui_input "MEMORY" "RAM in MB" "512")" || exit 0
+    if validate_uint "$val"; then CT_MEMORY="$val"; break; fi
+    ui_msg "INVALID VALUE" "Memory must be a positive integer."
+  done
+
+  val="$(ui_input "SWAP" "Swap in MB" "256")" || exit 0
+  [[ "$val" =~ ^[0-9]+$ ]] || {
+    ui_msg "INVALID VALUE" "Swap must be zero or a positive integer."
+    advanced_settings
+    return
+  }
+  CT_SWAP="$val"
+
+  while true; do
+    val="$(ui_input "DISK SIZE" "Root disk size in GB" "8")" || exit 0
+    if validate_uint "$val"; then CT_DISK_GB="$val"; break; fi
+    ui_msg "INVALID VALUE" "Disk size must be a positive integer."
+  done
+
+  TEMPLATE_STORAGE="$(choose_storage_menu template "")" || exit 0
+  CT_STORAGE="$(choose_storage_menu rootfs "")" || exit 0
+  CT_BRIDGE="$(choose_bridge_menu)" || exit 0
+
+  CT_NET_MODE="$(
+    ui_menu "NETWORK" "Select IPv4 configuration" \
+      "dhcp" "DHCP" \
+      "static" "Static IPv4"
+  )" || exit 0
+
+  CT_IPV4="dhcp"
+  CT_GATEWAY=""
+
+  if [[ "$CT_NET_MODE" == "static" ]]; then
+    while true; do
+      val="$(ui_input "STATIC IPV4" "IPv4 address in CIDR format, e.g. 172.16.0.20/24" "")" || exit 0
+      if [[ "$val" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        CT_IPV4="$val"
+        break
+      fi
+      ui_msg "INVALID IPV4" "Enter an IPv4 address with prefix, e.g. 172.16.0.20/24"
+    done
+    CT_GATEWAY="$(ui_input "GATEWAY" "IPv4 default gateway, e.g. 172.16.0.1" "")" || exit 0
+    [[ -n "$CT_GATEWAY" ]] || {
+      ui_msg "INVALID GATEWAY" "A gateway is required for static IPv4."
+      advanced_settings
+      return
+    }
+  fi
+
+  CT_VLAN="$(ui_input "VLAN" "VLAN tag (leave blank for none)" "")" || exit 0
+  if [[ -n "$CT_VLAN" && ! "$CT_VLAN" =~ ^[0-9]+$ ]]; then
+    ui_msg "INVALID VLAN" "VLAN must be numeric or blank."
+    advanced_settings
+    return
+  fi
+
+  if ui_yesno "CONTAINER TYPE" "Create an unprivileged LXC?\n\nRecommended: Yes"; then
+    CT_UNPRIVILEGED="1"
+  else
+    CT_UNPRIVILEGED="0"
+  fi
+}
+
+select_settings_mode() {
+  if ui_yesno "SETTINGS" \
+    "Use Default Settings?\n\nDefault:\n  Debian 13\n  1 CPU\n  512 MB RAM\n  8 GB disk\n  DHCP\n  Unprivileged LXC"; then
+    default_settings
+  else
+    advanced_settings
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# LDAP application settings
+# ---------------------------------------------------------------------------
+
+prompt_ldap_settings() {
+  local val p1 p2
+
+  while true; do
+    val="$(ui_input "LDAP DOMAIN" \
+      "Enter the LDAP naming domain.\n\nExample: lab.local\n\nThis will become dc=lab,dc=local" \
+      "")" || exit 0
+
+    val="${val//[[:space:]]/}"
+
+    if validate_domain "$val"; then
+      LDAP_DOMAIN="$val"
+      break
+    fi
+
+    ui_msg "INVALID LDAP DOMAIN" \
+      "Enter a DNS-style name containing at least two labels.\n\nExample: lab.local"
+  done
+
+  BASE_DN="$(domain_to_base_dn "$LDAP_DOMAIN")"
   FIRST_DC="${LDAP_DOMAIN%%.*}"
   LDAP_ADMIN_DN="cn=admin,${BASE_DN}"
   PEOPLE_DN="ou=people,${BASE_DN}"
   GROUPS_DN="ou=groups,${BASE_DN}"
-}
-
-prompt_password() {
-  local tty=/dev/tty
-  local p1 p2
-
-  echo
-  echo "LDAP Base DN:"
-  echo "  ${BASE_DN}"
-  echo
-  echo "OpenLDAP administrator DN:"
-  echo "  ${LDAP_ADMIN_DN}"
-  echo
 
   while true; do
-    read -r -s -p "Enter LDAP administrator password: " p1 < "$tty"
-    echo > "$tty"
+    p1="$(ui_password "LDAP ADMIN PASSWORD" \
+      "Administrator DN:\n${LDAP_ADMIN_DN}\n\nEnter a password (minimum 8 characters):")" || exit 0
 
-    [[ ${#p1} -ge 8 ]] || {
-      echo "Password must be at least 8 characters." > "$tty"
+    if ((${#p1} < 8)); then
+      ui_msg "PASSWORD TOO SHORT" "Use at least 8 characters."
       continue
-    }
+    fi
 
-    read -r -s -p "Confirm LDAP administrator password: " p2 < "$tty"
-    echo > "$tty"
+    p2="$(ui_password "CONFIRM PASSWORD" "Re-enter the LDAP administrator password:")" || exit 0
 
-    [[ "$p1" == "$p2" ]] || {
-      echo "Passwords do not match. Try again." > "$tty"
+    if [[ "$p1" != "$p2" ]]; then
+      ui_msg "PASSWORD MISMATCH" "Passwords do not match."
       continue
-    }
+    fi
 
     LDAP_ADMIN_PASSWORD="$p1"
     unset p1 p2
@@ -316,134 +439,132 @@ prompt_password() {
   done
 }
 
-next_vmid() {
-  if [[ -n "${CTID:-}" ]]; then
-    pct status "$CTID" >/dev/null 2>&1 && die "CTID ${CTID} already exists."
-    return
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+
+settings_summary() {
+  local network_summary
+  if [[ "$CT_NET_MODE" == "dhcp" ]]; then
+    network_summary="DHCP"
+  else
+    network_summary="${CT_IPV4}, GW ${CT_GATEWAY}"
   fi
 
-  CTID="$(pvesh get /cluster/nextid 2>/dev/null)"
-  [[ "$CTID" =~ ^[0-9]+$ ]] || die "Unable to determine next available CTID."
+  cat <<EOF
+Method:             ${METHOD}
+
+Container
+  CTID:             ${CTID}
+  Hostname:         ${CT_HOSTNAME}
+  OS:               Debian ${DEBIAN_RELEASE}
+  Architecture:     ${HOST_ARCH}
+  CPU:              ${CT_CORES} core(s)
+  RAM:              ${CT_MEMORY} MB
+  Swap:             ${CT_SWAP} MB
+  Disk:             ${CT_DISK_GB} GB
+  Rootfs storage:   ${CT_STORAGE}
+  Template storage: ${TEMPLATE_STORAGE}
+  Bridge:           ${CT_BRIDGE}
+  Network:          ${network_summary}
+  VLAN:             ${CT_VLAN:-none}
+  Unprivileged:     $([[ "$CT_UNPRIVILEGED" == 1 ]] && echo yes || echo no)
+
+LDAP
+  Domain:           ${LDAP_DOMAIN}
+  Base DN:          ${BASE_DN}
+  Administrator:    ${LDAP_ADMIN_DN}
+  Users OU:         ${PEOPLE_DN}
+  Groups OU:        ${GROUPS_DN}
+EOF
 }
 
-storage_supports() {
-  local storage="$1" content="$2"
-  pvesm status --content "$content" 2>/dev/null |
-    awk 'NR>1 {print $1}' |
-    grep -Fxq "$storage"
-}
+confirm_settings() {
+  local summary
+  summary="$(settings_summary)"
 
-detect_template_storage() {
-  if [[ -n "${TEMPLATE_STORAGE:-}" ]]; then
-    storage_supports "$TEMPLATE_STORAGE" vztmpl ||
-      die "TEMPLATE_STORAGE '${TEMPLATE_STORAGE}' does not support container templates."
-    return
+  if ! whiptail --backtitle "$BACKTITLE" \
+    --title "READY TO CREATE" \
+    --yesno "${summary}\n\nCreate the LXC and install OpenLDAP?" \
+    32 78; then
+
+    if ui_yesno "DO OVER" "Return to settings and start over?"; then
+      main_menu
+      exit 0
+    fi
+    exit 0
   fi
-
-  TEMPLATE_STORAGE="$(
-    pvesm status --content vztmpl 2>/dev/null |
-      awk 'NR>1 && $3=="active" {print $1; exit}'
-  )"
-  [[ -n "$TEMPLATE_STORAGE" ]] || die "No active Proxmox storage supporting 'vztmpl' was found."
 }
 
-detect_rootfs_storage() {
-  if [[ -n "${CT_STORAGE:-}" ]]; then
-    storage_supports "$CT_STORAGE" rootdir ||
-      die "CT_STORAGE '${CT_STORAGE}' does not support container root filesystems."
-    return
-  fi
-
-  CT_STORAGE="$(
-    pvesm status --content rootdir 2>/dev/null |
-      awk 'NR>1 && $3=="active" {print $1; exit}'
-  )"
-  [[ -n "$CT_STORAGE" ]] || die "No active Proxmox storage supporting 'rootdir' was found."
-}
-
-check_bridge() {
-  ip link show "$CT_BRIDGE" >/dev/null 2>&1 ||
-    die "Network bridge '${CT_BRIDGE}' does not exist. Set CT_BRIDGE if your bridge has another name."
-}
+# ---------------------------------------------------------------------------
+# Template handling
+# ---------------------------------------------------------------------------
 
 find_debian_template() {
   info "Refreshing Proxmox template index..."
   pveam update >/dev/null
 
+  # IMPORTANT: Proxmox may publish both amd64 and arm64 templates.
+  # Never select a template for the wrong CPU architecture: doing so
+  # creates an LXC that fails at /sbin/init with "Exec format error".
   TEMPLATE_NAME="$(
     pveam available --section system 2>/dev/null |
-      awk -v rel="$DEBIAN_RELEASE" '$2 ~ ("debian-" rel "-standard") {print $2}' |
+      awk -v rel="$DEBIAN_RELEASE" -v arch="$HOST_ARCH" '
+        $2 ~ ("debian-" rel "-standard") && $2 ~ ("_" arch "\\.tar") {print $2}
+      ' |
       sort -V |
       tail -1
   )"
 
   [[ -n "$TEMPLATE_NAME" ]] ||
-    die "Could not find a Debian ${DEBIAN_RELEASE} standard LXC template in pveam."
+    die "Unable to find a Debian ${DEBIAN_RELEASE} ${HOST_ARCH} standard template."
+
+  case "$TEMPLATE_NAME" in
+    *_"${HOST_ARCH}".tar.*) ;;
+    *) die "Safety check failed: template '${TEMPLATE_NAME}' does not match host architecture '${HOST_ARCH}'." ;;
+  esac
 
   TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}"
+  info "Selected template: ${TEMPLATE_NAME}"
 
-  if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}' | grep -Fxq "$TEMPLATE_REF"; then
-    info "Downloading ${TEMPLATE_NAME} to ${TEMPLATE_STORAGE}..."
+  if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null |
+       awk 'NR>1 {print $1}' |
+       grep -Fxq "$TEMPLATE_REF"; then
+    info "Downloading ${TEMPLATE_NAME}..."
     pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME"
-  else
-    ok "Template already present: ${TEMPLATE_NAME}"
   fi
 }
 
-show_plan() {
-  echo
-  echo "============================================================"
-  echo " OpenLDAP LXC deployment plan"
-  echo "============================================================"
-  echo " CTID:              ${CTID}"
-  echo " Hostname:          ${CT_HOSTNAME}"
-  echo " Debian:            ${DEBIAN_RELEASE}"
-  echo " Cores:             ${CT_CORES}"
-  echo " Memory:            ${CT_MEMORY} MB"
-  echo " Swap:              ${CT_SWAP} MB"
-  echo " Disk:              ${CT_DISK_GB} GB"
-  echo " Rootfs storage:    ${CT_STORAGE}"
-  echo " Template storage:  ${TEMPLATE_STORAGE}"
-  echo " Bridge:            ${CT_BRIDGE}"
-  echo " Network:           DHCP"
-  echo
-  echo " LDAP domain:       ${LDAP_DOMAIN}"
-  echo " Base DN:           ${BASE_DN}"
-  echo " Admin DN:          ${LDAP_ADMIN_DN}"
-  echo " Users OU:          ${PEOPLE_DN}"
-  echo " Groups OU:         ${GROUPS_DN}"
-  echo "============================================================"
-  echo
-
-  local answer
-  read -r -p "Create this LXC and install OpenLDAP? [Y/n]: " answer < /dev/tty
-  answer="${answer:-Y}"
-  [[ "$answer" =~ ^[Yy]$ ]] || exit 0
-}
+# ---------------------------------------------------------------------------
+# LXC creation
+# ---------------------------------------------------------------------------
 
 create_lxc() {
-  info "Creating Debian LXC ${CTID}..."
+  info "Creating LXC ${CTID} (${CT_HOSTNAME})..."
 
-  local net0
-  if [[ "${CT_NET_MODE:-dhcp}" == "static" ]]; then
-    net0="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IPV4},gw=${CT_GATEWAY},type=veth"
-  else
-    net0="name=eth0,bridge=${CT_BRIDGE},ip=dhcp,type=veth"
-  fi
+  local net="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IPV4},type=veth"
+  [[ -n "$CT_GATEWAY" ]] && net+=",gw=${CT_GATEWAY}"
+  [[ -n "$CT_VLAN" ]] && net+=",tag=${CT_VLAN}"
 
   pct create "$CTID" "$TEMPLATE_REF" \
+    --arch "$HOST_ARCH" \
     --hostname "$CT_HOSTNAME" \
     --cores "$CT_CORES" \
     --memory "$CT_MEMORY" \
     --swap "$CT_SWAP" \
     --rootfs "${CT_STORAGE}:${CT_DISK_GB}" \
-    --net0 "$net0" \
-    --unprivileged 1 \
-    --features nesting=0 \
-    --onboot "${CT_ONBOOT:-1}" \
+    --net0 "$net" \
+    --unprivileged "$CT_UNPRIVILEGED" \
+    --onboot 1 \
     --start 0
 
-  ok "LXC ${CTID} created."
+  local created_arch
+  created_arch="$(pct config "$CTID" | awk '/^arch:/ {print $2}')"
+  if [[ "$created_arch" != "$HOST_ARCH" ]]; then
+    die "Created LXC architecture is '${created_arch:-unknown}', expected '${HOST_ARCH}'. Refusing to start it."
+  fi
+
+  ok "LXC ${CTID} created with architecture ${created_arch}."
 }
 
 start_lxc() {
@@ -452,21 +573,22 @@ start_lxc() {
 
   local i
   for i in {1..60}; do
-    if pct exec "$CTID" -- systemctl is-system-running --wait >/dev/null 2>&1; then
-      break
+    if pct exec "$CTID" -- true >/dev/null 2>&1; then
+      ok "Container is ready."
+      return
     fi
     sleep 2
   done
 
-  pct exec "$CTID" -- true >/dev/null 2>&1 ||
-    die "Container started but pct exec is not responding."
-
-  ok "LXC ${CTID} is running."
+  die "Container did not become ready."
 }
+
+# ---------------------------------------------------------------------------
+# Guest installer
+# ---------------------------------------------------------------------------
 
 build_guest_installer() {
   GUEST_SCRIPT="$(mktemp)"
-  chmod 0600 "$GUEST_SCRIPT"
 
   cat > "$GUEST_SCRIPT" <<'GUEST'
 #!/usr/bin/env bash
@@ -481,17 +603,18 @@ PEOPLE_DN="${PEOPLE_DN:?}"
 GROUPS_DN="${GROUPS_DN:?}"
 LDAP_ADMIN_PASSWORD="${LDAP_ADMIN_PASSWORD:?}"
 
-info() { printf '[INFO] %s\n' "$*"; }
-ok()   { printf '[ OK ] %s\n' "$*"; }
-die()  { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+info() { echo "[INFO] $*"; }
+ok()   { echo "[ OK ] $*"; }
+die()  { echo "[FAIL] $*" >&2; exit 1; }
 
 export DEBIAN_FRONTEND=noninteractive
 
-info "Updating Debian packages..."
+info "Updating Debian..."
 apt-get update
 apt-get -y upgrade
 
-info "Installing OpenLDAP and phpLDAPadmin..."
+info "Installing OpenLDAP, Apache and phpLDAPadmin..."
+
 debconf-set-selections <<EOF
 slapd slapd/no_configuration boolean false
 slapd slapd/domain string ${LDAP_DOMAIN}
@@ -505,7 +628,8 @@ slapd slapd/allow_ldap_v2 boolean false
 EOF
 
 apt-get install -y --no-install-recommends \
-  slapd ldap-utils apache2 libapache2-mod-php phpldapadmin \
+  slapd ldap-utils \
+  apache2 libapache2-mod-php phpldapadmin \
   openssl ssl-cert ca-certificates
 
 systemctl enable --now slapd apache2
@@ -515,8 +639,9 @@ DB_DN="$(
     -b cn=config "(olcSuffix=${BASE_DN})" dn 2>/dev/null |
     awk '/^dn: /{sub(/^dn: /,""); print; exit}'
 )"
-[[ -n "$DB_DN" ]] || die "Could not locate LDAP database for ${BASE_DN}."
+[[ -n "$DB_DN" ]] || die "Could not find OpenLDAP database for ${BASE_DN}."
 
+# Load memberof module if required.
 if ! ldapsearch -LLL -Y EXTERNAL -H ldapi:/// \
   -b cn=config '(objectClass=olcModuleList)' olcModuleLoad 2>/dev/null |
   grep -Eq '^olcModuleLoad: .*memberof'; then
@@ -545,6 +670,7 @@ EOF
   fi
 fi
 
+# Add memberOf overlay.
 if ! ldapsearch -LLL -Y EXTERNAL -H ldapi:/// \
   -b "$DB_DN" '(olcOverlay=memberof*)' dn 2>/dev/null |
   grep -q '^dn:'; then
@@ -563,15 +689,15 @@ EOF
 fi
 
 entry_exists() {
-  local dn="$1"
   ldapsearch -LLL -x \
     -H ldap://127.0.0.1 \
     -D "$LDAP_ADMIN_DN" \
     -w "$LDAP_ADMIN_PASSWORD" \
-    -b "$dn" -s base '(objectClass=*)' dn 2>/dev/null |
+    -b "$1" -s base '(objectClass=*)' dn 2>/dev/null |
     grep -q '^dn:'
 }
 
+# Base entry may already have been created by Debian slapd configuration.
 if ! entry_exists "$BASE_DN"; then
   ldapadd -x -H ldap://127.0.0.1 \
     -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" >/dev/null <<EOF
@@ -605,18 +731,66 @@ description: Groups
 EOF
 fi
 
+# Configure phpLDAPadmin.
+CFG="/etc/phpldapadmin/config.php"
+[[ -f "$CFG" ]] || die "phpLDAPadmin config not found."
 
-install_vcf_phpldapadmin_templates() {
-  info "Installing VCF-friendly phpLDAPadmin templates..."
+cp -a "$CFG" "${CFG}.pre-easy-openldap"
 
-  local tdir="/etc/phpldapadmin/templates/creation"
-  [[ -d "$tdir" ]] || die "phpLDAPadmin creation-template directory not found: $tdir"
+cat > /etc/phpldapadmin/easy-openldap.php <<EOF
+<?php
+\$servers->setValue('server','name','OpenLDAP (${LDAP_DOMAIN})');
+\$servers->setValue('server','host','127.0.0.1');
+\$servers->setValue('server','port',389);
+\$servers->setValue('server','base',array('${BASE_DN}'));
+\$servers->setValue('login','auth_type','session');
+\$servers->setValue('login','bind_id','${LDAP_ADMIN_DN}');
+\$servers->setValue('login','attr','dn');
+EOF
 
-  cat > "${tdir}/vcfUser.xml" <<'EOF_XML'
+chmod 0640 /etc/phpldapadmin/easy-openldap.php
+chown root:www-data /etc/phpldapadmin/easy-openldap.php
+
+if ! grep -q 'easy-openldap.php' "$CFG"; then
+  if grep -q '^?>' "$CFG"; then
+    sed -i "/^?>/i require_once '/etc/phpldapadmin/easy-openldap.php';" "$CFG"
+  else
+    printf "\nrequire_once '/etc/phpldapadmin/easy-openldap.php';\n" >> "$CFG"
+  fi
+fi
+
+if [[ -e /etc/apache2/conf-available/phpldapadmin.conf ]]; then
+  a2enconf phpldapadmin >/dev/null 2>&1 || true
+elif [[ -e /etc/phpldapadmin/apache.conf ]]; then
+  ln -sf /etc/phpldapadmin/apache.conf \
+    /etc/apache2/conf-available/phpldapadmin.conf
+  a2enconf phpldapadmin >/dev/null 2>&1 || true
+fi
+
+a2enmod ssl rewrite >/dev/null
+a2ensite default-ssl >/dev/null
+
+cat > /etc/apache2/conf-available/easy-openldap-https.conf <<'EOF'
+RewriteEngine On
+RewriteCond %{HTTPS} !=on
+RewriteRule ^/phpldapadmin(.*)$ https://%{HTTP_HOST}/phpldapadmin$1 [R=302,L]
+EOF
+
+a2enconf easy-openldap-https >/dev/null
+apache2ctl configtest >/dev/null
+systemctl restart apache2
+
+# Install simple VCF-oriented phpLDAPadmin creation templates.
+# These avoid the stock POSIX user template (uidNumber/gidNumber) and provide
+# a plain inetOrgPerson user plus groupOfNames group.
+TEMPLATE_DIR="/etc/phpldapadmin/templates/creation"
+[[ -d "$TEMPLATE_DIR" ]] || die "phpLDAPadmin template directory not found: ${TEMPLATE_DIR}"
+
+cat > "${TEMPLATE_DIR}/custom_vcfUser.xml" <<'EOF_XML'
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE template SYSTEM "template.dtd">
 <template>
-  <description>Simple LDAP authentication user for VCF</description>
+  <description>Simple VCF LDAP authentication user</description>
   <icon>ldap-user.png</icon>
   <invalid>0</invalid>
   <rdn>uid</rdn>
@@ -639,7 +813,6 @@ install_vcf_phpldapadmin_templates() {
     <attribute id="givenName">
       <display>First name</display>
       <icon>ldap-uid.png</icon>
-      <onchange>=autoFill(cn;%givenName% %sn%)</onchange>
       <order>2</order>
       <page>1</page>
     </attribute>
@@ -647,7 +820,6 @@ install_vcf_phpldapadmin_templates() {
     <attribute id="sn">
       <display>Last name</display>
       <icon>ldap-uid.png</icon>
-      <onchange>=autoFill(cn;%givenName% %sn%)</onchange>
       <order>3</order>
       <page>1</page>
     </attribute>
@@ -689,7 +861,7 @@ install_vcf_phpldapadmin_templates() {
 </template>
 EOF_XML
 
-  cat > "${tdir}/vcfGroup.xml" <<'EOF_XML'
+cat > "${TEMPLATE_DIR}/custom_vcfGroup.xml" <<'EOF_XML'
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE template SYSTEM "template.dtd">
 <template>
@@ -728,77 +900,15 @@ EOF_XML
 </template>
 EOF_XML
 
-  chmod 0644 "${tdir}/vcfUser.xml" "${tdir}/vcfGroup.xml"
+chmod 0644 \
+  "${TEMPLATE_DIR}/custom_vcfUser.xml" \
+  "${TEMPLATE_DIR}/custom_vcfGroup.xml"
 
-  php -r '
-    foreach (array(
-      "/etc/phpldapadmin/templates/creation/vcfUser.xml",
-      "/etc/phpldapadmin/templates/creation/vcfGroup.xml"
-    ) as $f) {
-      libxml_use_internal_errors(true);
-      if (simplexml_load_file($f) === false) {
-        fwrite(STDERR, "Invalid XML: $f\n");
-        foreach (libxml_get_errors() as $e) fwrite(STDERR, trim($e->message)."\n");
-        exit(1);
-      }
-    }
-  '
-
-  systemctl restart apache2
-  ok "Installed phpLDAPadmin templates: VCF: User and VCF: Group."
-}
-
-info "Configuring phpLDAPadmin..."
-CFG=/etc/phpldapadmin/config.php
-[[ -f "$CFG" ]] || die "phpLDAPadmin config not found."
-
-cp -a "$CFG" "${CFG}.pre-easy-openldap" 2>/dev/null || true
-
-cat > /etc/phpldapadmin/easy-openldap.php <<EOF
-<?php
-\$servers->setValue('server','name','OpenLDAP (${LDAP_DOMAIN})');
-\$servers->setValue('server','host','127.0.0.1');
-\$servers->setValue('server','port',389);
-\$servers->setValue('server','base',array('${BASE_DN}'));
-\$servers->setValue('login','auth_type','session');
-\$servers->setValue('login','bind_id','${LDAP_ADMIN_DN}');
-\$servers->setValue('login','attr','dn');
-EOF
-
-chmod 0640 /etc/phpldapadmin/easy-openldap.php
-chown root:www-data /etc/phpldapadmin/easy-openldap.php
-
-if ! grep -q 'easy-openldap.php' "$CFG"; then
-  if grep -q '^?>' "$CFG"; then
-    sed -i "/^?>/i require_once '/etc/phpldapadmin/easy-openldap.php';" "$CFG"
-  else
-    printf "\nrequire_once '/etc/phpldapadmin/easy-openldap.php';\n" >> "$CFG"
-  fi
-fi
-
-if [[ -e /etc/apache2/conf-available/phpldapadmin.conf ]]; then
-  a2enconf phpldapadmin >/dev/null 2>&1 || true
-elif [[ -e /etc/phpldapadmin/apache.conf ]]; then
-  ln -sf /etc/phpldapadmin/apache.conf /etc/apache2/conf-available/phpldapadmin.conf
-  a2enconf phpldapadmin >/dev/null 2>&1 || true
-fi
-
-a2enmod ssl rewrite >/dev/null
-a2ensite default-ssl >/dev/null
-
-cat > /etc/apache2/conf-available/easy-openldap-https.conf <<'EOF'
-RewriteEngine On
-RewriteCond %{HTTPS} !=on
-RewriteRule ^/phpldapadmin(.*)$ https://%{HTTP_HOST}/phpldapadmin$1 [R=302,L]
-EOF
-
-a2enconf easy-openldap-https >/dev/null
-apache2ctl configtest >/dev/null
+# Clear phpLDAPadmin's cached template list by restarting Apache.
 systemctl restart apache2
+ok "Installed phpLDAPadmin templates: VCF: User and VCF: Group."
 
-install_vcf_phpldapadmin_templates
-
-info "Validating LDAP base-scope behavior..."
+# Validation 1: base scope must return exactly one object.
 COUNT="$(
   ldapsearch -LLL -x \
     -H ldap://127.0.0.1 \
@@ -807,17 +917,22 @@ COUNT="$(
     -b "$BASE_DN" -s base '(objectClass=*)' dn 2>/dev/null |
     grep -c '^dn:' || true
 )"
-[[ "$COUNT" == "1" ]] || die "Base-scope test returned ${COUNT} entries; expected exactly 1."
 
-info "Validating entryUUID and memberOf..."
+[[ "$COUNT" == "1" ]] ||
+  die "Base-scope validation returned ${COUNT} objects; expected 1."
+
+# Validation 2: inetOrgPerson + groupOfNames + memberOf + entryUUID.
 TEST_USER="uid=vcf-install-test,${PEOPLE_DN}"
 TEST_GROUP="cn=vcf-install-test,${GROUPS_DN}"
 TEST_HASH="$(slappasswd -s "$(openssl rand -hex 18)")"
 
-ldapdelete -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" "$TEST_GROUP" >/dev/null 2>&1 || true
-ldapdelete -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" "$TEST_USER" >/dev/null 2>&1 || true
+ldapdelete -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" \
+  -w "$LDAP_ADMIN_PASSWORD" "$TEST_GROUP" >/dev/null 2>&1 || true
+ldapdelete -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" \
+  -w "$LDAP_ADMIN_PASSWORD" "$TEST_USER" >/dev/null 2>&1 || true
 
-ldapadd -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" >/dev/null <<EOF
+ldapadd -x -H ldap://127.0.0.1 \
+  -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" >/dev/null <<EOF
 dn: ${TEST_USER}
 objectClass: top
 objectClass: person
@@ -842,6 +957,7 @@ MEMBEROF="$(
     -b "$TEST_USER" -s base '(objectClass=*)' memberOf 2>/dev/null |
     awk '/^memberOf: /{sub(/^memberOf: /,""); print; exit}'
 )"
+
 UUID="$(
   ldapsearch -LLL -x -H ldap://127.0.0.1 \
     -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" \
@@ -852,9 +968,12 @@ UUID="$(
 [[ "$MEMBEROF" == "$TEST_GROUP" ]] || die "memberOf validation failed."
 [[ -n "$UUID" ]] || die "entryUUID validation failed."
 
-ldapdelete -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" "$TEST_GROUP" >/dev/null
-ldapdelete -x -H ldap://127.0.0.1 -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" "$TEST_USER" >/dev/null
+ldapdelete -x -H ldap://127.0.0.1 \
+  -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" "$TEST_GROUP" >/dev/null
+ldapdelete -x -H ldap://127.0.0.1 \
+  -D "$LDAP_ADMIN_DN" -w "$LDAP_ADMIN_PASSWORD" "$TEST_USER" >/dev/null
 
+# Backup helper.
 cat > /usr/local/sbin/backup-openldap <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -884,7 +1003,7 @@ Users:
 Groups:
   ${GROUPS_DN}
 
-Suggested VCF-oriented mappings:
+VCF-oriented attributes:
   Users filter:         (objectClass=inetOrgPerson)
   Groups filter:        (objectClass=groupOfNames)
   User search attr:     uid
@@ -893,6 +1012,10 @@ Suggested VCF-oriented mappings:
   Membership:           memberOf
   Group member:         member
 
+phpLDAPadmin creation templates:
+  VCF: User             inetOrgPerson without POSIX UID/GID fields
+  VCF: Group            groupOfNames with member
+
 Backup:
   /usr/local/sbin/backup-openldap
 
@@ -900,41 +1023,38 @@ The LDAP administrator password is not stored by this installer.
 EOF
 chmod 0600 /root/OPENLDAP-README.txt
 
-ok "Guest configuration completed successfully."
+ok "OpenLDAP guest installation complete."
 GUEST
+
+  chmod 0700 "$GUEST_SCRIPT"
 }
 
-push_and_run_guest_installer() {
-  info "Copying installer into LXC..."
+run_guest_installer() {
   pct push "$CTID" "$GUEST_SCRIPT" /root/easy-openldap-guest.sh --perms 0700
 
-  info "Installing OpenLDAP inside LXC. This may take several minutes..."
+  info "Installing OpenLDAP inside LXC ${CTID}..."
 
-  # Send the password via stdin so it is not written into the guest script.
-  # The wrapper exports the non-secret configuration and reads one secret line.
-  printf '%s\n' "$LDAP_ADMIN_PASSWORD" | pct exec "$CTID" -- bash -c "
-    set -Eeuo pipefail
-    IFS= read -r LDAP_ADMIN_PASSWORD
-    export LDAP_ADMIN_PASSWORD
-    export LDAP_DOMAIN=$(printf '%q' "$LDAP_DOMAIN")
-    export BASE_DN=$(printf '%q' "$BASE_DN")
-    export FIRST_DC=$(printf '%q' "$FIRST_DC")
-    export LDAP_ADMIN_DN=$(printf '%q' "$LDAP_ADMIN_DN")
-    export PEOPLE_DN=$(printf '%q' "$PEOPLE_DN")
-    export GROUPS_DN=$(printf '%q' "$GROUPS_DN")
-    exec /root/easy-openldap-guest.sh
-  "
+  # Password is passed to guest installer through stdin, not written into the script.
+  printf '%s\n' "$LDAP_ADMIN_PASSWORD" |
+    pct exec "$CTID" -- bash -c "
+      set -Eeuo pipefail
+      IFS= read -r LDAP_ADMIN_PASSWORD
+      export LDAP_ADMIN_PASSWORD
+      export LDAP_DOMAIN=$(printf '%q' "$LDAP_DOMAIN")
+      export BASE_DN=$(printf '%q' "$BASE_DN")
+      export FIRST_DC=$(printf '%q' "$FIRST_DC")
+      export LDAP_ADMIN_DN=$(printf '%q' "$LDAP_ADMIN_DN")
+      export PEOPLE_DN=$(printf '%q' "$PEOPLE_DN")
+      export GROUPS_DN=$(printf '%q' "$GROUPS_DN")
+      exec /root/easy-openldap-guest.sh
+    "
 
   pct exec "$CTID" -- rm -f /root/easy-openldap-guest.sh || true
-  rm -f "$GUEST_SCRIPT"
   unset LDAP_ADMIN_PASSWORD
-  ok "OpenLDAP installation completed inside LXC."
 }
 
-get_container_ip() {
-  local ip=""
-  local i
-
+get_lxc_ip() {
+  local i ip=""
   for i in {1..60}; do
     ip="$(
       pct exec "$CTID" -- sh -c \
@@ -944,64 +1064,91 @@ get_container_ip() {
     [[ -n "$ip" ]] && break
     sleep 2
   done
-
-  CT_IP="${ip:-<check DHCP lease>}"
+  printf '%s' "${ip:-<check-container-IP>}"
 }
 
-final_message() {
-  get_container_ip
+show_completion() {
+  local ip
+  ip="$(get_lxc_ip)"
+
+  local msg
+  msg="OpenLDAP installation completed successfully.
+
+LXC
+  CTID:      ${CTID}
+  Hostname:  ${CT_HOSTNAME}
+  IP:        ${ip}
+
+phpLDAPadmin
+  https://${ip}/phpldapadmin
+
+Login DN
+  ${LDAP_ADMIN_DN}
+
+LDAP
+  Base DN:   ${BASE_DN}
+  Users:     ${PEOPLE_DN}
+  Groups:    ${GROUPS_DN}
+
+Use the LDAP administrator password entered during setup.
+
+The password was NOT saved to disk.
+
+Container notes:
+  /root/OPENLDAP-README.txt"
+
+  ui_msg "INSTALLATION COMPLETE" "$msg"
 
   echo
-  echo "================================================================"
-  echo " OpenLDAP LXC deployment complete"
-  echo "================================================================"
+  echo "=============================================================="
+  echo " OpenLDAP installation complete"
+  echo "=============================================================="
+  echo " CTID:        ${CTID}"
+  echo " Hostname:    ${CT_HOSTNAME}"
+  echo " IP:          ${ip}"
   echo
-  echo " LXC:"
-  echo "   CTID:      ${CTID}"
-  echo "   Hostname:  ${CT_HOSTNAME}"
-  echo "   IP:        ${CT_IP}"
-  echo
-  echo " Web administration UI:"
-  echo "   https://${CT_IP}/phpldapadmin"
+  echo " Web UI:"
+  echo "   https://${ip}/phpldapadmin"
   echo
   echo " Login DN:"
   echo "   ${LDAP_ADMIN_DN}"
   echo
-  echo " Use the LDAP administrator password you entered at the start."
-  echo
-  echo " LDAP:"
-  echo "   Base DN:   ${BASE_DN}"
-  echo "   Users:     ${PEOPLE_DN}"
-  echo "   Groups:    ${GROUPS_DN}"
-  echo
-  echo " The LDAP administrator password was NOT written to disk."
-  echo
-  echo " Container reference:"
-  echo "   pct enter ${CTID}"
-  echo "   /root/OPENLDAP-README.txt"
+  echo " Base DN:"
+  echo "   ${BASE_DN}"
   echo
   echo " Host log:"
   echo "   ${HOST_LOG}"
-  echo "================================================================"
+  echo "=============================================================="
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main_menu() {
+  select_settings_mode
+  prompt_ldap_settings
+  confirm_settings
+
+  find_debian_template
+  create_lxc
+  start_lxc
+  build_guest_installer
+  run_guest_installer
+  show_completion
 }
 
 main() {
   need_root
-  check_pve_host
+  check_pve
+  ensure_whiptail
 
-  configure_ct_ui
+  ui_msg "EASY OPENLDAP" \
+    "This helper creates a Debian LXC and installs native OpenLDAP + phpLDAPadmin.
 
-  prompt_domain
-  prompt_password
+Choose Default or Advanced container settings on the next screen."
 
-  find_debian_template
-  confirm_full_plan
-
-  create_lxc
-  start_lxc
-  build_guest_installer
-  push_and_run_guest_installer
-  final_message
+  main_menu
 }
 
 main "$@"

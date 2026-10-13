@@ -21,7 +21,7 @@
 #   CTID=305 \
 #   STORAGE=local-lvm \
 #   CT_PASSWORD='root-change-me-now' \
-#   SELKIES_USER=webtop \
+#   SELKIES_USER=jumpbox \
 #   SELKIES_PASSWORD='change-me-now' \
 #   SELKIES_UI_TITLE='My Browser Jumpbox' \
 #   ASSUME_YES=1 \
@@ -70,7 +70,7 @@
 # Example unattended invocation:
 #   CTID=305 STORAGE=local-lvm NET_MODE=dhcp \
 #   CT_PASSWORD='root-change-me-now' SELKIES_UI_TITLE='My Browser Jumpbox' \
-#   SELKIES_USER=webtop SELKIES_PASSWORD='change-me-now' \
+#   SELKIES_USER=jumpbox SELKIES_PASSWORD='change-me-now' \
 #   ASSUME_YES=1 ./install-selkies-jumpbox.sh
 #
 # References used for this implementation:
@@ -289,7 +289,7 @@ ask_secret CT_PASSWORD "LXC root login password" 12
 ask SELKIES_PORT "Selkies HTTPS port" "8080"
 normalize_uint SELKIES_PORT
 ((SELKIES_PORT>=1 && SELKIES_PORT<=65535)) || die "Invalid Selkies port."
-ask SELKIES_USER "Selkies login username" "webtop"
+ask SELKIES_USER "Selkies login username" "jumpbox"
 [[ "$SELKIES_USER" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid Selkies username."
 ask_secret SELKIES_PASSWORD "Selkies login password" 12
 [[ "$SELKIES_PASSWORD" =~ ^[A-Za-z0-9@%+=:,._-]+$ ]] || die "Selkies password may use letters, numbers, and @%+=:,._- only."
@@ -395,7 +395,7 @@ SELKIES_PASSWORD="$(printf '%s' "$SELKIES_PASS_B64" | base64 -d)"
 SELKIES_UI_TITLE="$(printf '%s' "$SELKIES_UI_TITLE_B64" | base64 -d)"
 TIMEZONE="$(printf '%s' "$TIMEZONE_B64" | base64 -d)"
 CF_TUNNEL_TOKEN="$(printf '%s' "$CF_TOKEN_B64" | base64 -d)"
-DESKTOP_USER="webtop"
+DESKTOP_USER="jumpbox"
 HOME_DIR="/home/${DESKTOP_USER}"
 
 step "Base packages"
@@ -424,7 +424,7 @@ install -d -m 0755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
   "$HOME_DIR/.config/openbox" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"
 
 step "Desktop terminal ping permissions"
-# Permit ICMP echo sockets for webtop's group inside this network namespace.
+# Permit ICMP echo sockets for the desktop account's group in this namespace.
 # This fixes ordinary ping without needing privileged raw sockets.
 DESKTOP_GID="$(id -g "$DESKTOP_USER")"
 install -d -m 0755 /etc/sysctl.d
@@ -601,7 +601,7 @@ SELKIES_BIND="--public"
 SELKIES_ADDR_ENV=""
 if [[ "$LOGIN_PROTECTION" == 1 ]]; then
   # Keep the public port stable; the protected backend is loopback-only.
-  # Selkies runs as webtop: always use an unprivileged backend port.
+  # Selkies runs as the desktop account: use an unprivileged backend port.
   SELKIES_BACKEND_PORT=$((SELKIES_PORT == 8081 ? 8082 : 8081))
   SELKIES_PUBLIC=false
   SELKIES_BIND="--addr=127.0.0.1"

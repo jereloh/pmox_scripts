@@ -16,14 +16,70 @@
 # requests per IP in 60 seconds; bans of 15 minutes, 1 hour, then 24 hours).
 # Default: 0, explicit opt-in.
 #
-# Unattended:
+# Unattended (run on the Proxmox host as root):
+# Copy this example and edit the values for your host and network before running.
+# Choose an unused CTID and static IP. STORAGE/TPL_STORAGE must support rootdir/
+# vztmpl respectively, and BRIDGE must exist on your host.
+# Both passwords require at least 12 characters. SELKIES_PASSWORD permits only
+# letters, numbers, and @%+=:,._- characters.
+# DNS_SERVER='' inherits Proxmox DNS. SEARCH_DOMAIN, VLAN_TAG, and CF_TUNNEL_TOKEN
+# are optional; leave them empty to skip. SELKIES_VERSION='' uses the latest release.
+# For DHCP, change NET_MODE to dhcp; STATIC_IP and STATIC_GW are then ignored.
+#
+# Field guide (optional means you may omit the whole assignment):
+#   Variable           Status          Default when omitted / guidance
+#   CTID               [optional]      Next available container ID
+#   CTNAME             [optional]      browser-jumpbox
+#   STORAGE            [optional]      First active lvmthin pool, else first rootdir pool
+#   TPL_STORAGE        [optional]      First active template storage
+#   BRIDGE             [optional]      First detected host bridge
+#   DISK_SIZE          [optional]      12 GB
+#   MEMORY             [optional]      4096 MiB
+#   SWAP               [optional]      1024 MiB
+#   CORES              [optional]      2
+#   NET_MODE           [static setup]  Set static for a static IP; default is dhcp
+#   STATIC_IP          [static setup]  Set your unused IPv4/CIDR; fallback 192.168.1.50/24
+#   STATIC_GW          [static setup]  Set your gateway; fallback 192.168.1.1
+#   DNS_SERVER         [optional]      Inherit Proxmox DNS
+#   SEARCH_DOMAIN      [optional]      No explicit DNS search domain
+#   VLAN_TAG           [optional]      No VLAN tag
+#   TIMEZONE           [optional]      Asia/Singapore
+#   CT_PASSWORD        [required]      LXC root password; no default
+#   SELKIES_PORT       [optional]      8080
+#   SELKIES_USER       [optional]      jumpbox
+#   SELKIES_PASSWORD   [required]      Browser login password; no default
+#   SELKIES_UI_TITLE   [optional]      Browser Jumpbox
+#   SELKIES_VERSION    [optional]      Latest release
+#   LOGIN_PROTECTION   [optional]      0; this example enables it with 1
+#   CF_TUNNEL_TOKEN    [optional]      No Cloudflare Tunnel
+#   ASSUME_YES         [required]      Set 1 for unattended mode; default is interactive
+#
+# Copyable command (do not put labels or comments after the trailing backslashes):
 #
 #   CTID=305 \
+#   CTNAME=browser-jumpbox \
 #   STORAGE=local-lvm \
+#   TPL_STORAGE=local \
+#   BRIDGE=vmbr0 \
+#   DISK_SIZE=12 \
+#   MEMORY=4096 \
+#   SWAP=1024 \
+#   CORES=2 \
+#   NET_MODE=static \
+#   STATIC_IP=192.168.1.50/24 \
+#   STATIC_GW=192.168.1.1 \
+#   DNS_SERVER=192.168.1.1 \
+#   SEARCH_DOMAIN='' \
+#   VLAN_TAG='' \
+#   TIMEZONE=Asia/Singapore \
 #   CT_PASSWORD='root-change-me-now' \
+#   SELKIES_PORT=8080 \
 #   SELKIES_USER=jumpbox \
 #   SELKIES_PASSWORD='change-me-now' \
 #   SELKIES_UI_TITLE='My Browser Jumpbox' \
+#   SELKIES_VERSION='' \
+#   LOGIN_PROTECTION=1 \
+#   CF_TUNNEL_TOKEN='' \
 #   ASSUME_YES=1 \
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/selkies-openbox-jumpbox-ff.sh)"
 #
@@ -64,14 +120,11 @@
 #           or point the tunnel at https://127.0.0.1:8080.
 #
 # Run on the Proxmox host as root:
-#   chmod +x install-selkies-jumpbox.sh
-#   ./install-selkies-jumpbox.sh
+#   chmod +x selkies-openbox-jumpbox-ff.sh
+#   ./selkies-openbox-jumpbox-ff.sh
 #
-# Example unattended invocation:
-#   CTID=305 STORAGE=local-lvm NET_MODE=dhcp \
-#   CT_PASSWORD='root-change-me-now' SELKIES_UI_TITLE='My Browser Jumpbox' \
-#   SELKIES_USER=jumpbox SELKIES_PASSWORD='change-me-now' \
-#   ASSUME_YES=1 ./install-selkies-jumpbox.sh
+# For a local unattended install, use the full Quick Start example above and
+# replace its final bash -c command with: bash ./selkies-openbox-jumpbox-ff.sh
 #
 # References used for this implementation:
 #   https://docs.selkies.io/latest/native

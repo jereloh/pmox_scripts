@@ -17,8 +17,10 @@
 #
 #   CTID=305 \
 #   STORAGE=local-lvm \
+#   CT_PASSWORD='root-change-me-now' \
 #   SELKIES_USER=webtop \
-#   SELKIES_PASSWORD='ChangeMe123!' \
+#   SELKIES_PASSWORD='change-me-now' \
+#   SELKIES_UI_TITLE='My Browser Jumpbox' \
 #   ASSUME_YES=1 \
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/selkies-openbox-jumpbox-ff.sh)"
 #
@@ -62,6 +64,7 @@
 #
 # Example unattended invocation:
 #   CTID=305 STORAGE=local-lvm NET_MODE=dhcp \
+#   CT_PASSWORD='root-change-me-now' SELKIES_UI_TITLE='My Browser Jumpbox' \
 #   SELKIES_USER=webtop SELKIES_PASSWORD='change-me-now' \
 #   ASSUME_YES=1 ./install-selkies-jumpbox.sh
 #
@@ -276,6 +279,8 @@ if [[ -n "$VLAN_TAG" ]]; then
 fi
 ask TIMEZONE "Timezone" "Asia/Singapore"
 valid_timezone "$TIMEZONE" || die "Invalid timezone: '$TIMEZONE'."
+ask_secret CT_PASSWORD "LXC root login password" 12
+[[ "$CT_PASSWORD" != *$'\n'* && "$CT_PASSWORD" != *$'\r'* ]] || die "LXC root password must be a single line."
 ask SELKIES_PORT "Selkies HTTPS port" "8080"
 normalize_uint SELKIES_PORT
 ((SELKIES_PORT>=1 && SELKIES_PORT<=65535)) || die "Invalid Selkies port."
@@ -283,6 +288,8 @@ ask SELKIES_USER "Selkies login username" "webtop"
 [[ "$SELKIES_USER" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid Selkies username."
 ask_secret SELKIES_PASSWORD "Selkies login password" 12
 [[ "$SELKIES_PASSWORD" =~ ^[A-Za-z0-9@%+=:,._-]+$ ]] || die "Selkies password may use letters, numbers, and @%+=:,._- only."
+ask SELKIES_UI_TITLE "Selkies page/sidebar header" "Browser Jumpbox"
+(( ${#SELKIES_UI_TITLE} <= 128 )) && [[ "$SELKIES_UI_TITLE" =~ [^[:space:]] && ! "$SELKIES_UI_TITLE" =~ [[:cntrl:]] ]] || die "Selkies header must contain visible text, be at most 128 characters, and contain no control characters."
 ask_optional CF_TUNNEL_TOKEN "Cloudflare Tunnel token"
 [[ -z "${SELKIES_VERSION:-}" || "$SELKIES_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "Invalid SELKIES_VERSION release tag."
 
@@ -298,6 +305,7 @@ DNS:         ${DNS_SERVER:-inherited}${SEARCH_DOMAIN:+, search ${SEARCH_DOMAIN}}
 Desktop:     Openbox + PCManFM + QTerminal
 Browser:     Firefox native DEB, always auto-started
 Streaming:   Selkies native package, software encoding, HTTPS:${SELKIES_PORT}
+UI header:   ${SELKIES_UI_TITLE}
 Audio:       Enabled
 Cloudflare:  $([[ -n "$CF_TUNNEL_TOKEN" ]] && echo enabled || echo disabled)
 ================================================
@@ -322,6 +330,7 @@ fi
 PCT_ARGS=(
   "$CTID" "$TPL_VOLID"
   --ostype ubuntu --arch amd64 --hostname "$CTNAME"
+  --password "$CT_PASSWORD"
   --rootfs "${STORAGE}:${DISK_SIZE}"
   --memory "$MEMORY" --swap "$SWAP" --cores "$CORES"
   --net0 "$NET0" --unprivileged 1 --onboot 1 --start 0
@@ -358,9 +367,10 @@ done
 CT_IP="$(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
 ok "LXC network ready at ${CT_IP:-unknown}."
 
-# Encode secrets so they are not interpreted by the host or guest shell while staging.
+# Encode user-supplied values so they are not interpreted while staging.
 SELKIES_USER_B64="$(printf '%s' "$SELKIES_USER" | base64 -w0)"
 SELKIES_PASS_B64="$(printf '%s' "$SELKIES_PASSWORD" | base64 -w0)"
+SELKIES_UI_TITLE_B64="$(printf '%s' "$SELKIES_UI_TITLE" | base64 -w0)"
 TIMEZONE_B64="$(printf '%s' "$TIMEZONE" | base64 -w0)"
 CF_TOKEN_B64="$(printf '%s' "$CF_TUNNEL_TOKEN" | base64 -w0)"
 
@@ -374,6 +384,7 @@ retry() { local max="$1"; shift; local n=1; until "$@"; do ((n>=max)) && return 
 
 SELKIES_USER="$(printf '%s' "$SELKIES_USER_B64" | base64 -d)"
 SELKIES_PASSWORD="$(printf '%s' "$SELKIES_PASS_B64" | base64 -d)"
+SELKIES_UI_TITLE="$(printf '%s' "$SELKIES_UI_TITLE_B64" | base64 -d)"
 TIMEZONE="$(printf '%s' "$TIMEZONE_B64" | base64 -d)"
 CF_TUNNEL_TOKEN="$(printf '%s' "$CF_TOKEN_B64" | base64 -d)"
 DESKTOP_USER="webtop"
@@ -510,6 +521,9 @@ touch "${SELKIES_APP_READY_FILE:?Missing session readiness path}"
 EOF
 
 step "Selkies service"
+# EnvironmentFile uses double-quote escaping, without shell expansion.
+UI_TITLE_ENV="${SELKIES_UI_TITLE//\\/\\\\}"
+UI_TITLE_ENV="${UI_TITLE_ENV//\"/\\\"}"
 install -d -m 0750 /etc/selkies
 install -m 0600 /dev/null /etc/selkies/jumpbox.env
 cat >/etc/selkies/jumpbox.env <<EOF
@@ -530,7 +544,7 @@ SELKIES_ENABLE_CLIPBOARD=true
 SELKIES_CLIPBOARD_SEAMLESS=true
 SELKIES_FILE_TRANSFERS=upload,download
 SELKIES_FILE_MANAGER_PATH=${HOME_DIR}/Downloads
-SELKIES_UI_TITLE=Browser Jumpbox
+SELKIES_UI_TITLE="${UI_TITLE_ENV}"
 SELKIES_ENABLE_RESIZE=true
 SELKIES_MODE=websockets
 SELKIES_MICROPHONE_ENABLED=false
@@ -645,6 +659,7 @@ log "Provisioning Openbox, Firefox, Selkies, audio, and optional Cloudflare Tunn
 pct exec "$CTID" -- env \
   SELKIES_USER_B64="$SELKIES_USER_B64" \
   SELKIES_PASS_B64="$SELKIES_PASS_B64" \
+  SELKIES_UI_TITLE_B64="$SELKIES_UI_TITLE_B64" \
   TIMEZONE_B64="$TIMEZONE_B64" \
   CF_TOKEN_B64="$CF_TOKEN_B64" \
   SELKIES_VERSION="${SELKIES_VERSION:-}" \
@@ -662,6 +677,8 @@ Browser Jumpbox Ready
 =========================================================
 Local URL:       https://${CT_IP}:${SELKIES_PORT}/
 Login user:      ${SELKIES_USER}
+UI header:       ${SELKIES_UI_TITLE}
+LXC login:       root (password supplied during installation)
 Selkies:         ${SELKIES_INSTALLED:-installed}
 Firefox:         auto-starts with every desktop session
 Audio:           enabled, output device output.monitor

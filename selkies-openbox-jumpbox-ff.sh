@@ -74,7 +74,9 @@ umask 077
 
 VERSION="1.0.0"
 SCRIPT_NAME="selkies-jumpbox"
-HOST_TMP="$(mktemp -d "/tmp/${SCRIPT_NAME}.XXXXXX")"
+HOST_TMP=""
+HOST_PID="$BASHPID"
+FAILURE_LINE="unknown"
 CT_CREATED=0
 CTID="${CTID:-}"
 
@@ -86,24 +88,32 @@ fi
 log()  { printf '%s[+]%s %s\n' "$BLU" "$RST" "$*"; }
 ok()   { printf '%s[OK]%s %s\n' "$GRN" "$RST" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$YLW" "$RST" "$*" >&2; }
-die()  { printf '%s[x]%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+die()  { FAILURE_LINE="${BASH_LINENO[0]}"; printf '%s[x]%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
 
-cleanup() { rm -rf "$HOST_TMP"; }
-on_err() {
-  local rc=$? line="${1:-unknown}"
-  trap - ERR
-  warn "Installation failed at host-script line ${line} (exit ${rc})."
-  if [[ "$CT_CREATED" == 1 && -n "${CTID:-}" ]]; then
+cleanup() { if [[ -n "$HOST_TMP" ]]; then rm -rf -- "$HOST_TMP"; fi; }
+on_exit() {
+  local rc=$?
+  # Command substitutions and subshells must not clean up or roll back the host.
+  [[ "$BASHPID" == "$HOST_PID" ]] || return "$rc"
+  trap - ERR EXIT INT TERM
+  set +e
+  if ((rc != 0)); then
+    warn "Installation failed at host-script line ${FAILURE_LINE} (exit ${rc})."
+  fi
+  if ((rc != 0)) && [[ "$CT_CREATED" == 1 && -n "${CTID:-}" ]]; then
     warn "Container ${CTID} exists but provisioning did not complete."
-    if [[ "${ASSUME_YES:-0}" == 1 ]]; then
+    if [[ "${ASSUME_YES:-0}" == 1 ]] || ((rc == 130 || rc == 143)); then
       warn "Leaving CT ${CTID} for inspection: pct enter ${CTID}"
     else
       local ans
       read -r -p "Destroy CT ${CTID} and roll back? [y/N]: " ans || true
       if [[ "${ans:-n}" =~ ^[Yy]$ ]]; then
         pct stop "$CTID" >/dev/null 2>&1 || true
-        pct destroy "$CTID" --purge >/dev/null 2>&1 || true
-        ok "Rolled back CT ${CTID}."
+        if pct destroy "$CTID" --purge; then
+          ok "Rolled back CT ${CTID}."
+        else
+          warn "Rollback failed for CT ${CTID}; inspect it with pct status ${CTID}."
+        fi
       else
         warn "Preserved CT ${CTID}: pct enter ${CTID}"
       fi
@@ -112,9 +122,10 @@ on_err() {
   cleanup
   exit "$rc"
 }
-trap 'on_err $LINENO' ERR
-trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'FAILURE_LINE=$LINENO' ERR
+trap on_exit EXIT
+trap 'FAILURE_LINE=$LINENO; exit 130' INT
+trap 'FAILURE_LINE=$LINENO; exit 143' TERM
 
 need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
 ask() {
@@ -155,7 +166,10 @@ choose() {
   local var="$1" prompt="$2"; shift 2
   local -a vals=("$@")
   ((${#vals[@]})) || die "No choices available for $prompt"
-  if [[ -n "${!var:-}" ]]; then return; fi
+  if [[ -n "${!var:-}" ]]; then
+    contains "${!var}" "${vals[@]}" || die "Invalid ${var}: '${!var}' is not an available choice."
+    return
+  fi
   if [[ "${ASSUME_YES:-0}" == 1 ]]; then printf -v "$var" '%s' "${vals[0]}"; return; fi
   echo "$prompt"
   local i n
@@ -163,52 +177,76 @@ choose() {
   while true; do
     read -r -p "Select [1]: " n
     n="${n:-1}"
-    [[ "$n" =~ ^[0-9]+$ ]] && ((n>=1 && n<=${#vals[@]})) && {
+    [[ "$n" =~ ^[0-9]{1,9}$ ]] && ((10#$n>=1 && 10#$n<=${#vals[@]})) && {
+      n=$((10#$n))
       printf -v "$var" '%s' "${vals[$((n-1))]}"; return;
     }
     warn "Invalid selection."
   done
 }
+contains() {
+  local wanted="$1" item; shift
+  for item in "$@"; do [[ "$item" == "$wanted" ]] && return 0; done
+  return 1
+}
+normalize_uint() {
+  local var="$1" value="${!1}"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$var must be a nonnegative integer."
+  value="${value#"${value%%[!0]*}"}"
+  value="${value:-0}"
+  ((${#value}<=10)) && ((10#$value<=2147483647)) || die "$var is too large."
+  printf -v "$var" '%d' "$((10#$value))"
+}
+valid_timezone() {
+  [[ "$1" =~ ^([A-Za-z0-9_+-]+/)*[A-Za-z0-9_+-]+$ && -f "/usr/share/zoneinfo/$1" ]]
+}
 valid_ipv4() {
   local ip="$1" IFS=. a b c d
+  [[ "$ip" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
   read -r a b c d <<<"$ip" || return 1
   [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
   ((a<=255 && b<=255 && c<=255 && d<=255))
 }
 valid_cidr() {
   local value="$1" ip="${1%/*}" cidr="${1#*/}"
-  [[ "$value" == */* && "$cidr" =~ ^[0-9]+$ ]] || return 1
-  valid_ipv4 "$ip" && ((cidr>=1 && cidr<=32))
+  [[ "$value" == */* && "$cidr" =~ ^[0-9]{1,2}$ ]] || return 1
+  valid_ipv4 "$ip" && ((10#$cidr>=1 && 10#$cidr<=32))
 }
 
 [[ $EUID -eq 0 ]] || die "Run as root on the Proxmox VE host."
-for cmd in pveversion pvesh pvesm pveam pct curl awk grep base64; do need "$cmd"; done
+for cmd in pveversion pvesh pvesm pveam pct curl awk grep base64 ip; do need "$cmd"; done
+HOST_TMP="$(mktemp -d "/tmp/${SCRIPT_NAME}.XXXXXX")"
 PVE_VERSION="$(pveversion | sed -n 's|^pve-manager/\([^/]*\)/.*|\1|p')"
 log "Detected Proxmox VE ${PVE_VERSION:-unknown}."
 
-mapfile -t ROOT_STORAGES < <(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
-DEFAULT_STORAGE="$(pvesm status |awk '$2=="lvmthin" && $3=="active" {print $1; exit}')"
-mapfile -t TPL_STORAGES < <(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
-mapfile -t BRIDGES < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+ROOT_STATUS="$(pvesm status -content rootdir)"
+TPL_STATUS="$(pvesm status -content vztmpl)"
+BRIDGE_STATUS="$(ip -o link show type bridge)"
+mapfile -t ROOT_STORAGES < <(awk 'NR>1 && $3=="active" {print $1}' <<<"$ROOT_STATUS")
+DEFAULT_STORAGE="$(awk '$2=="lvmthin" && $3=="active" && !found {print $1; found=1}' <<<"$ROOT_STATUS")"
+mapfile -t TPL_STORAGES < <(awk 'NR>1 && $3=="active" {print $1}' <<<"$TPL_STATUS")
+mapfile -t BRIDGES < <(awk -F': ' '{print $2}' <<<"$BRIDGE_STATUS" | cut -d@ -f1 | awk 'NF')
 ((${#ROOT_STORAGES[@]})) || die "No active storage supports LXC rootdir content."
 ((${#TPL_STORAGES[@]})) || die "No active storage supports vztmpl content."
-((${#BRIDGES[@]})) || BRIDGES=(vmbr0)
+((${#BRIDGES[@]})) || die "No host network bridge found."
 
-NEXTID="$(pvesh get /cluster/nextid)"
+NEXTID=""
+[[ -n "$CTID" ]] || NEXTID="$(pvesh get /cluster/nextid)"
 ask CTID "Container ID" "$NEXTID"
-[[ "$CTID" =~ ^[0-9]+$ ]] && ((CTID>=100)) || die "CTID must be numeric and >= 100."
-! pct status "$CTID" >/dev/null 2>&1 || die "CT/VM ID $CTID is already in use."
+normalize_uint CTID
+((CTID>=100 && CTID<=999999999)) || die "CTID must be between 100 and 999999999."
+pvesh get /cluster/nextid --vmid "$CTID" >/dev/null || die "CT/VM ID $CTID is unavailable; see the cluster check above."
 ask CTNAME "Container hostname" "browser-jumpbox"
 [[ "$CTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] || die "Invalid hostname."
 ask STORAGE "Storage pool for rootfs" "${DEFAULT_STORAGE:-${ROOT_STORAGES[0]}}"
-printf '%s\n' "${ROOT_STORAGES[@]}" | grep -qx "$STORAGE" || die "Storage '$STORAGE' is not an active rootdir-capable storage."
+contains "$STORAGE" "${ROOT_STORAGES[@]}" || die "Storage '$STORAGE' is not an active rootdir-capable storage."
 choose TPL_STORAGE "Select Ubuntu template storage:" "${TPL_STORAGES[@]}"
 choose BRIDGE "Select network bridge:" "${BRIDGES[@]}"
 ask DISK_SIZE "Disk size in GB" "12"
 ask MEMORY "Memory in MiB" "4096"
 ask SWAP "Swap in MiB" "1024"
 ask CORES "CPU cores" "2"
-for pair in DISK_SIZE MEMORY SWAP CORES; do [[ "${!pair}" =~ ^[0-9]+$ ]] || die "$pair must be numeric."; done
+for pair in DISK_SIZE MEMORY SWAP CORES; do normalize_uint "$pair"; done
 ((DISK_SIZE>=8 && MEMORY>=1024 && CORES>=1)) || die "Minimums: 8 GB disk, 1024 MiB RAM, 1 core."
 
 ask NET_MODE "IPv4 mode: dhcp or static" "dhcp"
@@ -218,6 +256,7 @@ if [[ "$NET_MODE" == static ]]; then
   ask STATIC_IP "Static IPv4 with CIDR" "192.168.1.50/24"
   ask STATIC_GW "IPv4 gateway" "192.168.1.1"
   valid_cidr "$STATIC_IP" || die "Invalid static IPv4/CIDR."
+  STATIC_IP="${STATIC_IP%/*}/$((10#${STATIC_IP#*/}))"
   valid_ipv4 "$STATIC_GW" || die "Invalid IPv4 gateway."
   NET0="name=eth0,bridge=${BRIDGE},ip=${STATIC_IP},gw=${STATIC_GW}"
 else
@@ -228,17 +267,21 @@ ask_optional DNS_SERVER "DNS server IP; blank inherits from Proxmox"
 ask_optional SEARCH_DOMAIN "DNS search domain"
 ask_optional VLAN_TAG "VLAN tag"
 if [[ -n "$VLAN_TAG" ]]; then
-  [[ "$VLAN_TAG" =~ ^[0-9]+$ ]] && ((VLAN_TAG>=1 && VLAN_TAG<=4094)) || die "VLAN must be 1-4094."
+  normalize_uint VLAN_TAG
+  ((VLAN_TAG>=1 && VLAN_TAG<=4094)) || die "VLAN must be 1-4094."
   NET0+=",tag=${VLAN_TAG}"
 fi
 ask TIMEZONE "Timezone" "Asia/Singapore"
+valid_timezone "$TIMEZONE" || die "Invalid timezone: '$TIMEZONE'."
 ask SELKIES_PORT "Selkies HTTPS port" "8080"
-[[ "$SELKIES_PORT" =~ ^[0-9]+$ ]] && ((SELKIES_PORT>=1 && SELKIES_PORT<=65535)) || die "Invalid Selkies port."
+normalize_uint SELKIES_PORT
+((SELKIES_PORT>=1 && SELKIES_PORT<=65535)) || die "Invalid Selkies port."
 ask SELKIES_USER "Selkies login username" "webtop"
 [[ "$SELKIES_USER" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Invalid Selkies username."
 ask_secret SELKIES_PASSWORD "Selkies login password" 12
 [[ "$SELKIES_PASSWORD" =~ ^[A-Za-z0-9@%+=:,._-]+$ ]] || die "Selkies password may use letters, numbers, and @%+=:,._- only."
 ask_optional CF_TUNNEL_TOKEN "Cloudflare Tunnel token"
+[[ -z "${SELKIES_VERSION:-}" || "$SELKIES_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "Invalid SELKIES_VERSION release tag."
 
 cat <<SUMMARY
 
@@ -279,12 +322,18 @@ PCT_ARGS=(
   --rootfs "${STORAGE}:${DISK_SIZE}"
   --memory "$MEMORY" --swap "$SWAP" --cores "$CORES"
   --net0 "$NET0" --unprivileged 1 --onboot 1 --start 0
+  --features nesting=1
   --tags "selkies;firefox;jumpbox"
 )
 [[ -n "$DNS_SERVER" ]] && PCT_ARGS+=(--nameserver "$DNS_SERVER")
 [[ -n "$SEARCH_DOMAIN" ]] && PCT_ARGS+=(--searchdomain "$SEARCH_DOMAIN")
 log "Creating unprivileged LXC ${CTID}."
-pct create "${PCT_ARGS[@]}"
+# Allow the mapped container root to traverse Proxmox's new host directories.
+# Keep the private umask in the parent for temporary files and secrets.
+(
+  umask 022
+  exec pct create "${PCT_ARGS[@]}"
+)
 CT_CREATED=1
 pct start "$CTID"
 
@@ -307,6 +356,7 @@ CF_TOKEN_B64="$(printf '%s' "$CF_TUNNEL_TOKEN" | base64 -w0)"
 cat >"${HOST_TMP}/provision.sh" <<'PROVISION'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 022
 export DEBIAN_FRONTEND=noninteractive
 step() { printf '\n=== %s ===\n' "$*"; }
 retry() { local max="$1"; shift; local n=1; until "$@"; do ((n>=max)) && return 1; sleep $((n*3)); ((n++)); done; }
@@ -332,13 +382,21 @@ step "Desktop account"
 if ! id "$DESKTOP_USER" >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash "$DESKTOP_USER"
 fi
+usermod -a -G ssl-cert "$DESKTOP_USER"
+make-ssl-cert generate-default-snakeoil
+for tls_file in /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/ssl/private/ssl-cert-snakeoil.key; do
+  runuser -u "$DESKTOP_USER" -- test -r "$tls_file" || {
+    echo "Desktop user cannot read TLS file: $tls_file" >&2; exit 1;
+  }
+done
 install -d -m 0755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
   "$HOME_DIR/.config/openbox" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"
 
 step "Firefox native Mozilla DEB"
 install -d -m 0755 /etc/apt/keyrings
 wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc
-FPR="$(gpg -n -q --import --import-options import-show /etc/apt/keyrings/packages.mozilla.org.asc 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')"
+KEY_INFO="$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/packages.mozilla.org.asc)"
+FPR="$(awk -F: '$1=="fpr" && !found {print $10; found=1}' <<<"$KEY_INFO")"
 EXPECTED="35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"
 [[ "$FPR" == "$EXPECTED" ]] || { echo "Mozilla signing-key fingerprint mismatch: ${FPR:-none}" >&2; exit 1; }
 echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' >/etc/apt/sources.list.d/mozilla.list
@@ -347,21 +405,32 @@ Package: *
 Pin: origin packages.mozilla.org
 Pin-Priority: 1000
 EOF
+chmod 0644 /etc/apt/keyrings/packages.mozilla.org.asc \
+  /etc/apt/sources.list.d/mozilla.list /etc/apt/preferences.d/mozilla
 retry 3 apt-get update
 apt-get install -y --no-install-recommends firefox
 
 step "Selkies native Ubuntu package"
-SELKIES_VERSION="$(curl -fsSL https://api.github.com/repos/selkies-project/selkies/releases/latest | jq -r '.tag_name')"
-[[ -n "$SELKIES_VERSION" && "$SELKIES_VERSION" != null ]] || { echo "Could not resolve Selkies release." >&2; exit 1; }
+RELEASE_SELECTOR="latest"
+[[ -z "${SELKIES_VERSION:-}" ]] || RELEASE_SELECTOR="tags/${SELKIES_VERSION}"
+RELEASE_JSON="$(mktemp)"
+retry 3 curl -fsSL --connect-timeout 10 --max-time 60 \
+  "https://api.github.com/repos/selkies-project/selkies/releases/${RELEASE_SELECTOR}" -o "$RELEASE_JSON"
+SELKIES_VERSION="$(jq -er '.tag_name | select(type == "string" and length > 0)' "$RELEASE_JSON")"
+[[ "$SELKIES_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "Invalid Selkies release tag." >&2; exit 1; }
 . /etc/os-release
 DISTRO="ubuntu${VERSION_ID}"
 ARCH="$(dpkg --print-architecture)"
 PKG="selkies-${SELKIES_VERSION}-${DISTRO}-${ARCH}.deb"
+PKG_URL="$(jq -er --arg name "$PKG" '[.assets[] | select(.name == $name) | .browser_download_url] | if length == 1 then .[0] else error("Selkies release does not contain exactly one package for this distribution and architecture") end' "$RELEASE_JSON")"
+[[ "$PKG_URL" == "https://github.com/selkies-project/selkies/releases/download/"* ]] || { echo "Unexpected Selkies package URL." >&2; exit 1; }
+rm -f "$RELEASE_JSON"
 cd /tmp
-retry 3 curl -fL -o "$PKG" "https://github.com/selkies-project/selkies/releases/download/${SELKIES_VERSION}/${PKG}"
+retry 3 curl -fL --connect-timeout 10 --max-time 300 -o "$PKG" "$PKG_URL"
 apt-get install -y "./${PKG}"
 rm -f "$PKG"
 command -v selkies-session >/dev/null || { echo "selkies-session was not installed." >&2; exit 1; }
+selkies --version
 
 step "Openbox session"
 cat >"$HOME_DIR/.config/openbox/autostart" <<'EOF'
@@ -385,8 +454,39 @@ EOF
 if [[ -f /etc/xdg/openbox/rc.xml ]]; then cp /etc/xdg/openbox/rc.xml "$HOME_DIR/.config/openbox/rc.xml"; fi
 chown -R "$DESKTOP_USER:$DESKTOP_USER" "$HOME_DIR/.config" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"
 
+# Selkies supplies DISPLAY, XAUTHORITY and PULSE_SERVER to this session wrapper.
+cat >/usr/local/bin/jumpbox-session <<'SESSION'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+READY_FILE="${SELKIES_APP_READY_FILE:?Missing session readiness path}"
+rm -f "$READY_FILE"
+AUDIO_DEADLINE=$((SECONDS + 30))
+until pactl info >/dev/null 2>&1; do
+  ((SECONDS < AUDIO_DEADLINE)) || { echo "PulseAudio did not become ready." >&2; exit 1; }
+  sleep 1
+done
+SINKS="$(pactl list short sinks)"
+if ! awk '$2=="output" {found=1} END {exit !found}' <<<"$SINKS"; then
+  pactl load-module module-null-sink sink_name=output >/dev/null
+fi
+pactl set-default-sink output
+pactl set-default-source output.monitor
+SOURCES="$(pactl list short sources)"
+awk '$2=="output.monitor" {found=1} END {exit !found}' <<<"$SOURCES" || {
+  echo "PulseAudio output.monitor was not created." >&2; exit 1;
+}
+# Openbox's session autostart runs only once its display is ready.
+exec /usr/bin/openbox-session
+SESSION
+chmod 0755 /usr/local/bin/jumpbox-session
+# Signal readiness from autostart, after the audio wrapper and Openbox started.
+cat >>"$HOME_DIR/.config/openbox/autostart" <<'EOF'
+touch "${SELKIES_APP_READY_FILE:?Missing session readiness path}"
+EOF
+
 step "Selkies service"
 install -d -m 0750 /etc/selkies
+install -m 0600 /dev/null /etc/selkies/jumpbox.env
 cat >/etc/selkies/jumpbox.env <<EOF
 SELKIES_BASIC_AUTH_USER=${SELKIES_USER}
 SELKIES_BASIC_AUTH_PASSWORD=${SELKIES_PASSWORD}
@@ -399,6 +499,8 @@ SELKIES_AUTO_GPU=false
 SELKIES_AUDIO_ENABLED=true
 SELKIES_AUDIO_ON_START=true
 SELKIES_AUDIO_DEVICE_NAME=output.monitor
+SELKIES_APP_WAIT_READY=true
+SELKIES_APP_READY_FILE=/run/selkies-jumpbox/desktop-ready
 SELKIES_ENABLE_CLIPBOARD=true
 SELKIES_CLIPBOARD_SEAMLESS=true
 SELKIES_FILE_TRANSFERS=upload,download
@@ -424,9 +526,13 @@ Group=${DESKTOP_USER}
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
 Environment=USER=${DESKTOP_USER}
-Environment=DISPLAY=:0
+RuntimeDirectory=selkies-jumpbox
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/selkies-jumpbox
 EnvironmentFile=/etc/selkies/jumpbox.env
-ExecStart=/usr/bin/selkies-session --session=openbox --public --port=${SELKIES_PORT} --enable-https=true --use-cpu=true --auto-gpu=false
+ExecStartPre=/usr/bin/rm -f /run/selkies-jumpbox/desktop-ready
+ExecStart=/usr/bin/selkies-session --session=/usr/local/bin/jumpbox-session --public --port=${SELKIES_PORT} --enable-https=true --use-cpu=true --auto-gpu=false
+ExecStartPost=/bin/sh -c 'until test -f /run/selkies-jumpbox/desktop-ready; do sleep 1; done'
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=90
@@ -435,16 +541,19 @@ TimeoutStartSec=90
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now selkies-jumpbox.service
+systemctl enable selkies-jumpbox.service
+systemctl start --no-block selkies-jumpbox.service
 
 if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
   step "Cloudflare Tunnel"
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
   echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' >/etc/apt/sources.list.d/cloudflared.list
+  chmod 0644 /usr/share/keyrings/cloudflare-main.gpg /etc/apt/sources.list.d/cloudflared.list
   retry 3 apt-get update
   apt-get install -y --no-install-recommends cloudflared
   install -d -m 0750 /etc/cloudflared
+  install -m 0600 /dev/null /etc/cloudflared/tunnel.env
   printf 'CF_TUNNEL_TOKEN=%s\n' "$CF_TUNNEL_TOKEN" >/etc/cloudflared/tunnel.env
   chmod 0600 /etc/cloudflared/tunnel.env
   cat >/etc/systemd/system/cloudflared-jumpbox.service <<'EOF'
@@ -468,10 +577,30 @@ EOF
 fi
 
 step "Health checks"
-for _ in $(seq 1 30); do systemctl is-active --quiet selkies-jumpbox.service && break; sleep 2; done
-systemctl is-active --quiet selkies-jumpbox.service
-CODE="$(curl -sk -u "${SELKIES_USER}:${SELKIES_PASSWORD}" -o /dev/null -w '%{http_code}' "https://127.0.0.1:${SELKIES_PORT}/" || true)"
-[[ "$CODE" =~ ^(200|301|302)$ ]] || { echo "Selkies HTTPS health check returned HTTP ${CODE:-none}." >&2; journalctl -u selkies-jumpbox -n 80 --no-pager >&2; exit 1; }
+HTTPS_URL="https://127.0.0.1:${SELKIES_PORT}/"
+HEALTH_DEADLINE=$((SECONDS + 120))
+CODE="000"
+HTTPS_READY=0
+while ((SECONDS < HEALTH_DEADLINE)); do
+  REMAINING=$((HEALTH_DEADLINE - SECONDS))
+  REQUEST_TIMEOUT=5
+  ((REMAINING >= REQUEST_TIMEOUT)) || REQUEST_TIMEOUT="$REMAINING"
+  CODE="$(curl -sk --connect-timeout 2 --max-time "$REQUEST_TIMEOUT" \
+    -u "${SELKIES_USER}:${SELKIES_PASSWORD}" -o /dev/null -w '%{http_code}' "$HTTPS_URL" || true)"
+  if [[ "$CODE" == 200 ]] && systemctl is-active --quiet selkies-jumpbox.service; then
+    HTTPS_READY=1; break
+  fi
+  if [[ "$CODE" == 401 || "$CODE" == 403 ]]; then break; fi
+  if ((SECONDS < HEALTH_DEADLINE)); then sleep 1; fi
+done
+if (( ! HTTPS_READY )); then
+  echo "Selkies HTTPS did not become ready within 120 seconds (HTTP ${CODE:-none})." >&2
+  systemctl status selkies-jumpbox --no-pager >&2 || true
+  journalctl -u selkies-jumpbox -n 80 --no-pager >&2 || true
+  exit 1
+fi
+UNAUTH_CODE="$(curl -sk --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' "$HTTPS_URL" || true)"
+[[ "$UNAUTH_CODE" == 401 ]] || { echo "Selkies authentication check expected HTTP 401, got ${UNAUTH_CODE:-none}." >&2; exit 1; }
 if [[ -n "$CF_TUNNEL_TOKEN" ]]; then systemctl is-active --quiet cloudflared-jumpbox.service; fi
 
 apt-get clean
@@ -487,6 +616,7 @@ pct exec "$CTID" -- env \
   SELKIES_PASS_B64="$SELKIES_PASS_B64" \
   TIMEZONE_B64="$TIMEZONE_B64" \
   CF_TOKEN_B64="$CF_TOKEN_B64" \
+  SELKIES_VERSION="${SELKIES_VERSION:-}" \
   SELKIES_PORT="$SELKIES_PORT" \
   bash /root/provision.sh
 pct exec "$CTID" -- rm -f /root/provision.sh

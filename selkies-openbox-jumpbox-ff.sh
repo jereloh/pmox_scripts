@@ -12,8 +12,9 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/selkies-openbox-jumpbox-ff.sh)"
 #
 # Optional: preseed SELKIES_VERSION with a release tag; otherwise use the latest release.
-# Optional: LOGIN_PROTECTION=1 installs NGINX + Fail2ban (10 failed requests
-# per IP in 60 seconds, banned for 15 minutes). Default: 0, explicit opt-in.
+# Optional: LOGIN_PROTECTION=1 installs NGINX + Fail2ban (5 failed credentialed
+# requests per IP in 60 seconds; bans of 15 minutes, 1 hour, then 24 hours).
+# Default: 0, explicit opt-in.
 #
 # Unattended:
 #
@@ -314,7 +315,7 @@ Streaming:   Selkies native package, software encoding, HTTPS:${SELKIES_PORT}
 UI header:   ${SELKIES_UI_TITLE}
 Audio:       Enabled
 Cloudflare:  $([[ -n "$CF_TUNNEL_TOKEN" ]] && echo enabled || echo disabled)
-Login bans:  $([[ "$LOGIN_PROTECTION" == 1 ]] && echo '10 failed requests/IP in 60s; block 15 minutes' || echo disabled)
+Login bans:  $([[ "$LOGIN_PROTECTION" == 1 ]] && echo '5 failed requests/IP in 60s; bans: 15m, 1h, then 24h max' || echo disabled)
 ================================================
 SUMMARY
 if [[ "${ASSUME_YES:-0}" != 1 ]]; then
@@ -828,6 +829,11 @@ actionunban = /usr/local/sbin/selkies-nginx-ban unban <ip>
 [Init]
 actionstart_on_demand = false
 EOF
+  cat >/etc/fail2ban/fail2ban.local <<'EOF'
+[Definition]
+# Retain repeat-ban history longer than the maximum ban duration.
+dbpurgeage = 7d
+EOF
   cat >/etc/fail2ban/jail.d/selkies-basic-auth.local <<'EOF'
 # This fresh-install desktop jail bans HTTP visitors, not the tunnel socket.
 [sshd]
@@ -840,8 +846,11 @@ logpath = /var/log/nginx/selkies-auth-failures.log
 usedns = no
 ignoreip = 127.0.0.0/8 ::1
 findtime = 60
-maxretry = 10
+maxretry = 5
 bantime = 900
+bantime.increment = true
+bantime.multipliers = 1 4 96
+bantime.maxtime = 86400
 action = selkies-nginx
 EOF
   install -d -m 0755 /etc/systemd/system/fail2ban.service.d
@@ -942,7 +951,7 @@ if [[ "$LOGIN_PROTECTION" == 1 ]]; then
   [[ "$(wc -l </var/log/nginx/selkies-auth-failures.log)" == "$BEFORE" ]] || {
     echo "Login protection counted a challenge or successful login." >&2; exit 1;
   }
-  for _ in $(seq 1 10); do
+  for _ in $(seq 1 5); do
     curl -sk --max-time 5 -H "CF-Connecting-IP: $TEST_VISITOR" \
       -u "${SELKIES_USER}:${SELKIES_PASSWORD}-installation-invalid" -o /dev/null "$HTTPS_URL"
   done
@@ -1002,7 +1011,7 @@ Firefox:         auto-starts with every desktop session
 Taskbar:         bottom panel with Firefox, Terminal, window buttons, and clock
 Audio:           enabled, output device output.monitor
 Cloudflare:      $([[ -n "$CF_TUNNEL_TOKEN" ]] && echo enabled || echo disabled)
-Login bans:      $([[ "$LOGIN_PROTECTION" == 1 ]] && echo 'enabled: 10 failures/IP in 60s; 15-minute block' || echo disabled)
+Login bans:      $([[ "$LOGIN_PROTECTION" == 1 ]] && echo 'enabled: 5 failures/IP in 60s; 15m, 1h, then 24h max' || echo disabled)
 
 Administration:
   Enter LXC:     pct enter ${CTID}

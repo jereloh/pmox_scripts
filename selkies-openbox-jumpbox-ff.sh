@@ -187,6 +187,7 @@ PVE_VERSION="$(pveversion | sed -n 's|^pve-manager/\([^/]*\)/.*|\1|p')"
 log "Detected Proxmox VE ${PVE_VERSION:-unknown}."
 
 mapfile -t ROOT_STORAGES < <(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+DEFAULT_STORAGE="$(pvesm status |awk '$2=="lvmthin" && $3=="active" {print $1; exit}')"
 mapfile -t TPL_STORAGES < <(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
 mapfile -t BRIDGES < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
 ((${#ROOT_STORAGES[@]})) || die "No active storage supports LXC rootdir content."
@@ -199,7 +200,8 @@ ask CTID "Container ID" "$NEXTID"
 ! pct status "$CTID" >/dev/null 2>&1 || die "CT/VM ID $CTID is already in use."
 ask CTNAME "Container hostname" "browser-jumpbox"
 [[ "$CTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] || die "Invalid hostname."
-choose STORAGE "Select LXC rootfs storage:" "${ROOT_STORAGES[@]}"
+ask STORAGE "Storage pool for rootfs" "${DEFAULT_STORAGE:-${ROOT_STORAGES[0]}}"
+printf '%s\n' "${ROOT_STORAGES[@]}" | grep -qx "$STORAGE" || die "Storage '$STORAGE' is not an active rootdir-capable storage."
 choose TPL_STORAGE "Select Ubuntu template storage:" "${TPL_STORAGES[@]}"
 choose BRIDGE "Select network bridge:" "${BRIDGES[@]}"
 ask DISK_SIZE "Disk size in GB" "12"

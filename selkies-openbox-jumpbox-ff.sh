@@ -11,6 +11,8 @@
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/selkies-openbox-jumpbox-ff.sh)"
 #
+# Optional: preseed SELKIES_VERSION with a release tag; otherwise use the latest release.
+#
 # Unattended:
 #
 #   CTID=305 \
@@ -41,7 +43,8 @@
 # Design goals
 #   - No Docker, Webtop image, nested container runtime, or GPU passthrough.
 #   - Software rendering and encoding for portability.
-#   - Unprivileged LXC with no AppArmor override.
+#   - Unprivileged LXC with AppArmor confinement disabled for desktop compatibility.
+#   - Set the new LXC's AppArmor profile to unconfined before its first boot.
 #   - Interactive Proxmox storage/network wizard.
 #   - Environment variables may preseed prompts for unattended deployment.
 #   - Preserve a failed LXC for inspection, or offer rollback interactively.
@@ -335,7 +338,15 @@ log "Creating unprivileged LXC ${CTID}."
   exec pct create "${PCT_ARGS[@]}"
 )
 CT_CREATED=1
+log "Configuring new LXC ${CTID} with AppArmor profile unconfined."
+CT_CONF="/etc/pve/lxc/${CTID}.conf"
+[[ -f "$CT_CONF" ]] || die "Created LXC configuration is missing: $CT_CONF"
+# This fresh container has no custom AppArmor entry. Configure it before boot;
+# keep unprivileged UID mapping and the other LXC isolation mechanisms.
+printf '\nlxc.apparmor.profile: unconfined\n' >>"$CT_CONF"
 pct start "$CTID"
+CT_AA_LABEL="$(pct exec "$CTID" -- cat /proc/self/attr/current)"
+[[ "$CT_AA_LABEL" == unconfined ]] || die "LXC is still AppArmor-confined: $CT_AA_LABEL"
 
 log "Waiting for network and DNS."
 NET_OK=0
@@ -373,7 +384,7 @@ ln -snf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
 echo "$TIMEZONE" >/etc/timezone
 retry 3 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl wget gnupg jq ssl-cert dbus-x11 \
+  ca-certificates curl wget gnupg jq ssl-cert dbus-x11 iputils-ping procps \
   xvfb x11-xserver-utils x11-utils openbox obconf \
   pcmanfm qterminal fonts-dejavu-core fonts-liberation \
   pulseaudio pulseaudio-utils alsa-utils
@@ -391,6 +402,20 @@ for tls_file in /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/ssl/private/ssl-cert-s
 done
 install -d -m 0755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
   "$HOME_DIR/.config/openbox" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"
+
+step "Desktop terminal ping permissions"
+# Permit ICMP echo sockets for webtop's group inside this network namespace.
+# This fixes ordinary ping without needing privileged raw sockets.
+DESKTOP_GID="$(id -g "$DESKTOP_USER")"
+install -d -m 0755 /etc/sysctl.d
+printf 'net.ipv4.ping_group_range = %s %s\n' "$DESKTOP_GID" "$DESKTOP_GID" \
+  >/etc/sysctl.d/99-selkies-jumpbox-ping.conf
+chmod 0644 /etc/sysctl.d/99-selkies-jumpbox-ping.conf
+sysctl -p /etc/sysctl.d/99-selkies-jumpbox-ping.conf
+# Loopback checks socket permissions without requiring upstream ICMP access.
+runuser -u "$DESKTOP_USER" -- ping -n -c 1 -W 2 127.0.0.1 >/dev/null || {
+  echo "Desktop user cannot ping loopback after configuring ICMP echo permissions." >&2; exit 1;
+}
 
 step "Firefox native Mozilla DEB"
 install -d -m 0755 /etc/apt/keyrings
@@ -530,6 +555,8 @@ RuntimeDirectory=selkies-jumpbox
 RuntimeDirectoryMode=0700
 Environment=XDG_RUNTIME_DIR=/run/selkies-jumpbox
 EnvironmentFile=/etc/selkies/jumpbox.env
+# Apply as container root at each start; guest sysctl boot loading can be skipped in LXC.
+ExecStartPre=+/usr/sbin/sysctl -p /etc/sysctl.d/99-selkies-jumpbox-ping.conf
 ExecStartPre=/usr/bin/rm -f /run/selkies-jumpbox/desktop-ready
 ExecStart=/usr/bin/selkies-session --session=/usr/local/bin/jumpbox-session --public --port=${SELKIES_PORT} --enable-https=true --use-cpu=true --auto-gpu=false
 ExecStartPost=/bin/sh -c 'until test -f /run/selkies-jumpbox/desktop-ready; do sleep 1; done'
@@ -594,7 +621,11 @@ while ((SECONDS < HEALTH_DEADLINE)); do
   if ((SECONDS < HEALTH_DEADLINE)); then sleep 1; fi
 done
 if (( ! HTTPS_READY )); then
-  echo "Selkies HTTPS did not become ready within 120 seconds (HTTP ${CODE:-none})." >&2
+  if [[ "$CODE" == 401 || "$CODE" == 403 ]]; then
+    echo "Selkies rejected the configured login credentials (HTTP $CODE)." >&2
+  else
+    echo "Selkies HTTPS did not become ready within 120 seconds (HTTP ${CODE:-none})." >&2
+  fi
   systemctl status selkies-jumpbox --no-pager >&2 || true
   journalctl -u selkies-jumpbox -n 80 --no-pager >&2 || true
   exit 1

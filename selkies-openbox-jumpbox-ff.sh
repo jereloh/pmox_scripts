@@ -12,6 +12,8 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/selkies-openbox-jumpbox-ff.sh)"
 #
 # Optional: preseed SELKIES_VERSION with a release tag; otherwise use the latest release.
+# Optional: LOGIN_PROTECTION=1 installs NGINX + Fail2ban (10 failed requests
+# per IP in 60 seconds, banned for 15 minutes). Default: 0, explicit opt-in.
 #
 # Unattended:
 #
@@ -33,6 +35,7 @@
 #       ├── Firefox (native Mozilla DEB, always auto-started)
 #       ├── PCManFM file manager
 #       ├── QTerminal
+#       ├── Tint2 bottom taskbar (Firefox/Terminal launchers, windows, clock)
 #       ├── PulseAudio virtual output
 #       ├── Selkies 2.x native Ubuntu package
 #       │   ├── Browser client on one HTTPS port
@@ -41,6 +44,7 @@
 #       │   ├── Clipboard synchronization
 #       │   └── File upload/download
 #       └── cloudflared tunnel (optional)
+#           With LOGIN_PROTECTION=1, NGINX fronts Selkies on the same HTTPS port.
 #
 # Design goals
 #   - No Docker, Webtop image, nested container runtime, or GPU passthrough.
@@ -78,7 +82,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="selkies-jumpbox"
 HOST_TMP=""
 HOST_PID="$BASHPID"
@@ -291,6 +295,8 @@ ask_secret SELKIES_PASSWORD "Selkies login password" 12
 ask SELKIES_UI_TITLE "Selkies page/sidebar header" "Browser Jumpbox"
 (( ${#SELKIES_UI_TITLE} <= 128 )) && [[ "$SELKIES_UI_TITLE" =~ [^[:space:]] && ! "$SELKIES_UI_TITLE" =~ [[:cntrl:]] ]] || die "Selkies header must contain visible text, be at most 128 characters, and contain no control characters."
 ask_optional CF_TUNNEL_TOKEN "Cloudflare Tunnel token"
+ask LOGIN_PROTECTION "Enable automatic failed-login blocking with NGINX + Fail2ban? 1=yes, 0=no" "0"
+[[ "$LOGIN_PROTECTION" == 0 || "$LOGIN_PROTECTION" == 1 ]] || die "LOGIN_PROTECTION must be 0 or 1."
 [[ -z "${SELKIES_VERSION:-}" || "$SELKIES_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "Invalid SELKIES_VERSION release tag."
 
 cat <<SUMMARY
@@ -302,12 +308,13 @@ Resources:   ${CORES} vCPU, ${MEMORY} MiB RAM, ${SWAP} MiB swap, ${DISK_SIZE} GB
 Storage:     ${STORAGE} (rootfs), ${TPL_STORAGE} (template)
 Network:     ${NET0}
 DNS:         ${DNS_SERVER:-inherited}${SEARCH_DOMAIN:+, search ${SEARCH_DOMAIN}}
-Desktop:     Openbox + PCManFM + QTerminal
+Desktop:     Openbox + Tint2 taskbar + PCManFM + QTerminal
 Browser:     Firefox native DEB, always auto-started
 Streaming:   Selkies native package, software encoding, HTTPS:${SELKIES_PORT}
 UI header:   ${SELKIES_UI_TITLE}
 Audio:       Enabled
 Cloudflare:  $([[ -n "$CF_TUNNEL_TOKEN" ]] && echo enabled || echo disabled)
+Login bans:  $([[ "$LOGIN_PROTECTION" == 1 ]] && echo '10 failed requests/IP in 60s; block 15 minutes' || echo disabled)
 ================================================
 SUMMARY
 if [[ "${ASSUME_YES:-0}" != 1 ]]; then
@@ -398,6 +405,7 @@ apt-get install -y --no-install-recommends \
   ca-certificates curl wget gnupg jq ssl-cert dbus-x11 iputils-ping procps \
   xvfb x11-xserver-utils x11-utils openbox obconf \
   pcmanfm qterminal fonts-dejavu-core fonts-liberation \
+  tint2 adwaita-icon-theme \
   pulseaudio pulseaudio-utils alsa-utils
 
 step "Desktop account"
@@ -469,9 +477,72 @@ command -v selkies-session >/dev/null || { echo "selkies-session was not install
 selkies --version
 
 step "Openbox session"
+install -d -m 0755 -o "$DESKTOP_USER" -g "$DESKTOP_USER" \
+  "$HOME_DIR/.config/tint2" "$HOME_DIR/.local/share/applications"
+cat >"$HOME_DIR/.local/share/applications/jumpbox-firefox.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Firefox
+Exec=/usr/bin/firefox --new-window about:blank
+Icon=firefox
+Terminal=false
+EOF
+cat >"$HOME_DIR/.local/share/applications/jumpbox-terminal.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Exec=/usr/bin/qterminal
+Icon=utilities-terminal
+Terminal=false
+EOF
+cat >"$HOME_DIR/.config/tint2/tint2rc" <<EOF
+# Opaque panel: no compositor needed.
+rounded = 0
+border_width = 0
+background_color = #242830 100
+rounded = 4
+border_width = 0
+background_color = #46546a 100
+panel_items = LTC
+panel_monitor = primary
+panel_position = bottom center horizontal
+panel_size = 100% 44
+panel_padding = 6 4 6
+panel_background_id = 1
+panel_layer = top
+strut_policy = follow_size
+autohide = 0
+launcher_padding = 4 0 6
+launcher_icon_size = 32
+launcher_icon_theme = Adwaita
+launcher_icon_theme_override = 1
+launcher_item_app = ${HOME_DIR}/.local/share/applications/jumpbox-firefox.desktop
+launcher_item_app = ${HOME_DIR}/.local/share/applications/jumpbox-terminal.desktop
+taskbar_mode = single_desktop
+taskbar_padding = 4 0 4
+taskbar_hide_inactive_tasks = 0
+task_text = 1
+task_icon = 1
+task_font = DejaVu Sans 10
+task_font_color = #e5e9f0 100
+task_maximum_size = 220 36
+task_padding = 8 2 6
+task_active_background_id = 2
+mouse_left = toggle_iconify
+mouse_middle = none
+mouse_right = none
+time1_format = %H:%M
+time1_font = DejaVu Sans 10
+clock_font_color = #e5e9f0 100
+clock_padding = 10 0
+tooltip = 1
+EOF
 cat >"$HOME_DIR/.config/openbox/autostart" <<'EOF'
 xset s off -dpms
 xsetroot -solid '#1d2021'
+# Start one taskbar per desktop session, rather than per browser connection.
+tint2 -c "$HOME/.config/tint2/tint2rc" &
+TASKBAR_PID=$!
 (sleep 2; firefox --new-window about:blank) &
 EOF
 cat >"$HOME_DIR/.config/openbox/menu.xml" <<'EOF'
@@ -488,7 +559,7 @@ cat >"$HOME_DIR/.config/openbox/menu.xml" <<'EOF'
 </openbox_menu>
 EOF
 if [[ -f /etc/xdg/openbox/rc.xml ]]; then cp /etc/xdg/openbox/rc.xml "$HOME_DIR/.config/openbox/rc.xml"; fi
-chown -R "$DESKTOP_USER:$DESKTOP_USER" "$HOME_DIR/.config" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"
+chown -R "$DESKTOP_USER:$DESKTOP_USER" "$HOME_DIR/.config" "$HOME_DIR/.local" "$HOME_DIR/Desktop" "$HOME_DIR/Downloads"
 
 # Selkies supplies DISPLAY, XAUTHORITY and PULSE_SERVER to this session wrapper.
 cat >/usr/local/bin/jumpbox-session <<'SESSION'
@@ -517,10 +588,24 @@ SESSION
 chmod 0755 /usr/local/bin/jumpbox-session
 # Signal readiness from autostart, after the audio wrapper and Openbox started.
 cat >>"$HOME_DIR/.config/openbox/autostart" <<'EOF'
+sleep 1
+kill -0 "$TASKBAR_PID" 2>/dev/null || { echo "Tint2 taskbar did not start." >&2; exit 1; }
 touch "${SELKIES_APP_READY_FILE:?Missing session readiness path}"
 EOF
 
 step "Selkies service"
+SELKIES_BACKEND_PORT="$SELKIES_PORT"
+SELKIES_PUBLIC=true
+SELKIES_BIND="--public"
+SELKIES_ADDR_ENV=""
+if [[ "$LOGIN_PROTECTION" == 1 ]]; then
+  # Keep the public port stable; the protected backend is loopback-only.
+  # Selkies runs as webtop: always use an unprivileged backend port.
+  SELKIES_BACKEND_PORT=$((SELKIES_PORT == 8081 ? 8082 : 8081))
+  SELKIES_PUBLIC=false
+  SELKIES_BIND="--addr=127.0.0.1"
+  SELKIES_ADDR_ENV="SELKIES_ADDR=127.0.0.1"
+fi
 # EnvironmentFile uses double-quote escaping, without shell expansion.
 UI_TITLE_ENV="${SELKIES_UI_TITLE//\\/\\\\}"
 UI_TITLE_ENV="${UI_TITLE_ENV//\"/\\\"}"
@@ -531,8 +616,9 @@ SELKIES_BASIC_AUTH_USER=${SELKIES_USER}
 SELKIES_BASIC_AUTH_PASSWORD=${SELKIES_PASSWORD}
 SELKIES_ENABLE_BASIC_AUTH=true
 SELKIES_ENABLE_HTTPS=true
-SELKIES_PUBLIC=true
-SELKIES_PORT=${SELKIES_PORT}
+SELKIES_PUBLIC=${SELKIES_PUBLIC}
+${SELKIES_ADDR_ENV}
+SELKIES_PORT=${SELKIES_BACKEND_PORT}
 SELKIES_USE_CPU=true
 SELKIES_AUTO_GPU=false
 SELKIES_AUDIO_ENABLED=true
@@ -572,7 +658,7 @@ EnvironmentFile=/etc/selkies/jumpbox.env
 # Apply as container root at each start; guest sysctl boot loading can be skipped in LXC.
 ExecStartPre=+/usr/sbin/sysctl -p /etc/sysctl.d/99-selkies-jumpbox-ping.conf
 ExecStartPre=/usr/bin/rm -f /run/selkies-jumpbox/desktop-ready
-ExecStart=/usr/bin/selkies-session --session=/usr/local/bin/jumpbox-session --public --port=${SELKIES_PORT} --enable-https=true --use-cpu=true --auto-gpu=false
+ExecStart=/usr/bin/selkies-session --session=/usr/local/bin/jumpbox-session ${SELKIES_BIND} --port=${SELKIES_BACKEND_PORT} --enable-https=true --use-cpu=true --auto-gpu=false
 ExecStartPost=/bin/sh -c 'until test -f /run/selkies-jumpbox/desktop-ready; do sleep 1; done'
 Restart=on-failure
 RestartSec=5
@@ -584,6 +670,194 @@ EOF
 systemctl daemon-reload
 systemctl enable selkies-jumpbox.service
 systemctl start --no-block selkies-jumpbox.service
+
+# Optional failed-login protection. Selkies remains the only password checker.
+if [[ "$LOGIN_PROTECTION" == 1 ]]; then
+  step "NGINX + Fail2ban login protection"
+  # Do not launch the packages' default listeners/jails before our config exists.
+  install_login_packages() {
+    local created_policy=0 apt_rc=0
+    if [[ ! -e /usr/sbin/policy-rc.d ]]; then
+      printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+      chmod 0755 /usr/sbin/policy-rc.d
+      created_policy=1
+    fi
+    apt-get install -y --no-install-recommends nginx fail2ban python3 || apt_rc=$?
+    if [[ "$created_policy" == 1 ]]; then rm -f /usr/sbin/policy-rc.d; fi
+    return "$apt_rc"
+  }
+  install_login_packages
+  rm -f /etc/nginx/sites-enabled/default
+  install -d -m 0750 /var/lib/selkies-login-protection
+  install -m 0600 /dev/null /var/lib/selkies-login-protection/bans.conf
+  install -m 0640 -o www-data -g adm /dev/null /var/log/nginx/selkies-auth-failures.log
+  cat >/etc/nginx/conf.d/selkies-protection.conf <<'EOF'
+map $http_upgrade $selkies_connection {
+    default upgrade;
+    '' close;
+}
+# Log only a boolean credential-presence flag, never the Authorization value.
+map $http_authorization $selkies_credentials_present {
+    '' 0;
+    default 1;
+}
+map "$status:$selkies_credentials_present" $selkies_auth_failure {
+    default 0;
+    "401:1" 1;
+}
+log_format selkies_auth '[$time_local] $remote_addr failed-basic-auth';
+geo $selkies_banned {
+    default 0;
+    include /var/lib/selkies-login-protection/bans.conf;
+}
+EOF
+  cat >/etc/nginx/sites-available/selkies-jumpbox <<'EOF'
+server {
+    listen PUBLIC_PORT ssl default_server;
+    listen [::]:PUBLIC_PORT ssl default_server;
+    server_name _;
+    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    # Only the co-located tunnel connector may supply the visitor IP.
+    set_real_ip_from 127.0.0.1;
+    set_real_ip_from ::1;
+    real_ip_header CF-Connecting-IP;
+    access_log /var/log/nginx/selkies-auth-failures.log selkies_auth if=$selkies_auth_failure;
+    if ($selkies_banned) { return 403; }
+    location / {
+        proxy_pass https://127.0.0.1:BACKEND_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $selkies_connection;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header CF-Connecting-IP $remote_addr;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        # Preserve Selkies' existing upload allowance.
+        client_max_body_size 0;
+    }
+}
+EOF
+  sed -i "s/PUBLIC_PORT/${SELKIES_PORT}/g; s/BACKEND_PORT/${SELKIES_BACKEND_PORT}/g" /etc/nginx/sites-available/selkies-jumpbox
+  ln -s /etc/nginx/sites-available/selkies-jumpbox /etc/nginx/sites-enabled/selkies-jumpbox
+  cat >/usr/local/sbin/selkies-nginx-ban <<'BAN_HELPER'
+#!/usr/bin/python3
+"""Root-only Fail2ban action: atomic, serialized IPv4/IPv6 NGINX bans."""
+import fcntl
+import ipaddress
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+BAN_FILE = Path('/var/lib/selkies-login-protection/bans.conf')
+LOCK_FILE = Path('/var/lib/selkies-login-protection/.bans.lock')
+
+def replace_file(content):
+    fd, name = tempfile.mkstemp(prefix='.selkies-bans-', dir=BAN_FILE.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+        os.replace(name, BAN_FILE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+def main():
+    if len(sys.argv) not in (2, 3) or sys.argv[1] not in ('ban', 'unban', 'clear'):
+        raise ValueError('Usage: selkies-nginx-ban ban|unban IP, or clear')
+    operation = sys.argv[1]
+    address = None
+    if operation != 'clear':
+        if len(sys.argv) != 3:
+            raise ValueError('Missing IP address')
+        address = ipaddress.ip_address(sys.argv[2])
+        if '%' in str(address):
+            raise ValueError('Scoped addresses are not accepted')
+        if operation == 'ban' and address.is_loopback:
+            raise ValueError('Refusing to ban the local connector')
+    elif len(sys.argv) != 2:
+        raise ValueError('clear takes no address')
+    # The lock lives in a root-owned directory, not a writable /tmp directory.
+    with os.fdopen(os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600), 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = BAN_FILE.read_text()
+        addresses = {ipaddress.ip_address(row.split()[0]) for row in previous.splitlines() if row.strip()}
+        if operation == 'clear':
+            addresses.clear()
+        elif operation == 'ban':
+            addresses.add(address)
+        else:
+            addresses.discard(address)
+        updated = ''.join(f'{ip} 1;\n' for ip in sorted(addresses, key=str))
+        if updated == previous:
+            return
+        replace_file(updated)
+        try:
+            subprocess.run(['/usr/sbin/nginx', '-t', '-q'], check=True)
+            subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], check=True)
+        except subprocess.CalledProcessError:
+            replace_file(previous)
+            subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], check=False)
+            raise
+
+if __name__ == '__main__':
+    main()
+BAN_HELPER
+  chmod 0700 /usr/local/sbin/selkies-nginx-ban
+  cat >/etc/fail2ban/filter.d/selkies-basic-auth.conf <<'EOF'
+[Definition]
+failregex = ^\s*<HOST> failed-basic-auth\s*$
+ignoreregex =
+datepattern = ^\[%%d/%%b/%%Y:%%H:%%M:%%S %%z\]
+EOF
+  cat >/etc/fail2ban/action.d/selkies-nginx.conf <<'EOF'
+[Definition]
+# Clear stale entries, then Fail2ban restores active bans from its database.
+actionstart = /usr/local/sbin/selkies-nginx-ban clear
+actionflush = /usr/local/sbin/selkies-nginx-ban clear
+actionban = /usr/local/sbin/selkies-nginx-ban ban <ip>
+actionunban = /usr/local/sbin/selkies-nginx-ban unban <ip>
+[Init]
+actionstart_on_demand = false
+EOF
+  cat >/etc/fail2ban/jail.d/selkies-basic-auth.local <<'EOF'
+# This fresh-install desktop jail bans HTTP visitors, not the tunnel socket.
+[sshd]
+enabled = false
+[selkies-basic-auth]
+enabled = true
+filter = selkies-basic-auth
+backend = polling
+logpath = /var/log/nginx/selkies-auth-failures.log
+usedns = no
+ignoreip = 127.0.0.0/8 ::1
+findtime = 60
+maxretry = 10
+bantime = 900
+action = selkies-nginx
+EOF
+  install -d -m 0755 /etc/systemd/system/fail2ban.service.d
+  cat >/etc/systemd/system/fail2ban.service.d/selkies-nginx.conf <<'EOF'
+[Unit]
+After=nginx.service
+Requires=nginx.service
+EOF
+  # Ubuntu's nginx logrotate rule covers *.log and reopens the logs on rotation.
+  nginx -t
+  fail2ban-client -t
+  systemctl daemon-reload
+  systemctl enable nginx fail2ban
+  systemctl restart nginx
+  systemctl restart fail2ban
+fi
 
 if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
   step "Cloudflare Tunnel"
@@ -613,6 +887,14 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+  if [[ "$LOGIN_PROTECTION" == 1 ]]; then
+    install -d -m 0755 /etc/systemd/system/cloudflared-jumpbox.service.d
+    cat >/etc/systemd/system/cloudflared-jumpbox.service.d/login-protection.conf <<'EOF'
+[Unit]
+After=nginx.service fail2ban.service
+Requires=nginx.service fail2ban.service
+EOF
+  fi
   systemctl daemon-reload
   systemctl enable --now cloudflared-jumpbox.service
 fi
@@ -646,6 +928,41 @@ if (( ! HTTPS_READY )); then
 fi
 UNAUTH_CODE="$(curl -sk --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' "$HTTPS_URL" || true)"
 [[ "$UNAUTH_CODE" == 401 ]] || { echo "Selkies authentication check expected HTTP 401, got ${UNAUTH_CODE:-none}." >&2; exit 1; }
+if [[ "$LOGIN_PROTECTION" == 1 ]]; then
+  step "Verify login bans through NGINX"
+  systemctl is-active --quiet nginx fail2ban
+  fail2ban-client status selkies-basic-auth
+  TEST_VISITOR=192.0.2.254
+  # Only installation's trusted loopback requests simulate a visitor header.
+  # Challenges and successful credentials must not increment the failure log.
+  BEFORE="$(wc -l </var/log/nginx/selkies-auth-failures.log)"
+  curl -sk --max-time 5 -H "CF-Connecting-IP: $TEST_VISITOR" -o /dev/null "$HTTPS_URL"
+  curl -sk --max-time 5 -H "CF-Connecting-IP: $TEST_VISITOR" \
+    -u "${SELKIES_USER}:${SELKIES_PASSWORD}" -o /dev/null "$HTTPS_URL"
+  [[ "$(wc -l </var/log/nginx/selkies-auth-failures.log)" == "$BEFORE" ]] || {
+    echo "Login protection counted a challenge or successful login." >&2; exit 1;
+  }
+  for _ in $(seq 1 10); do
+    curl -sk --max-time 5 -H "CF-Connecting-IP: $TEST_VISITOR" \
+      -u "${SELKIES_USER}:${SELKIES_PASSWORD}-installation-invalid" -o /dev/null "$HTTPS_URL"
+  done
+  BAN_VERIFIED=0
+  for _ in $(seq 1 15); do
+    TEST_CODE="$(curl -sk --max-time 5 -H "CF-Connecting-IP: $TEST_VISITOR" \
+      -u "${SELKIES_USER}:${SELKIES_PASSWORD}" -o /dev/null -w '%{http_code}' "$HTTPS_URL")"
+    if [[ "$TEST_CODE" == 403 ]]; then BAN_VERIFIED=1; break; fi
+    sleep 1
+  done
+  fail2ban-client set selkies-basic-auth unbanip "$TEST_VISITOR"
+  [[ "$BAN_VERIFIED" == 1 ]] || { echo "Failed-login ban was not enforced." >&2; exit 1; }
+  for _ in $(seq 1 15); do
+    TEST_CODE="$(curl -sk --max-time 5 -H "CF-Connecting-IP: $TEST_VISITOR" \
+      -u "${SELKIES_USER}:${SELKIES_PASSWORD}" -o /dev/null -w '%{http_code}' "$HTTPS_URL")"
+    [[ "$TEST_CODE" == 200 ]] && break
+    sleep 1
+  done
+  [[ "$TEST_CODE" == 200 ]] || { echo "Login access was not restored after unban." >&2; exit 1; }
+fi
 if [[ -n "$CF_TUNNEL_TOKEN" ]]; then systemctl is-active --quiet cloudflared-jumpbox.service; fi
 
 apt-get clean
@@ -663,6 +980,7 @@ pct exec "$CTID" -- env \
   TIMEZONE_B64="$TIMEZONE_B64" \
   CF_TOKEN_B64="$CF_TOKEN_B64" \
   SELKIES_VERSION="${SELKIES_VERSION:-}" \
+  LOGIN_PROTECTION="$LOGIN_PROTECTION" \
   SELKIES_PORT="$SELKIES_PORT" \
   bash /root/provision.sh
 pct exec "$CTID" -- rm -f /root/provision.sh
@@ -681,8 +999,10 @@ UI header:       ${SELKIES_UI_TITLE}
 LXC login:       root (password supplied during installation)
 Selkies:         ${SELKIES_INSTALLED:-installed}
 Firefox:         auto-starts with every desktop session
+Taskbar:         bottom panel with Firefox, Terminal, window buttons, and clock
 Audio:           enabled, output device output.monitor
 Cloudflare:      $([[ -n "$CF_TUNNEL_TOKEN" ]] && echo enabled || echo disabled)
+Login bans:      $([[ "$LOGIN_PROTECTION" == 1 ]] && echo 'enabled: 10 failures/IP in 60s; 15-minute block' || echo disabled)
 
 Administration:
   Enter LXC:     pct enter ${CTID}
@@ -696,3 +1016,12 @@ https://127.0.0.1:${SELKIES_PORT} and disable origin TLS verification, or replac
 the Selkies certificate with one trusted by cloudflared.
 =========================================================
 DONE
+if [[ "$LOGIN_PROTECTION" == 1 ]]; then
+  cat <<BANS
+Login protection administration:
+  List bans:     pct exec ${CTID} -- fail2ban-client status selkies-basic-auth
+  Unban an IP:   pct exec ${CTID} -- fail2ban-client set selkies-basic-auth unbanip <IP>
+  Ban log:       pct exec ${CTID} -- journalctl -u fail2ban -f
+Keep cloudflared in this LXC and use the same HTTPS origin port shown above.
+BANS
+fi

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.1)
+# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.2)
 # ==============================================================================
 #
 # Usage:
+#   # Fresh install:
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-docker-host.sh)"
+#
+#   # Update an existing host (preserves /etc/vdi-ctl.conf & running sessions):
+#   bash setup-selkies-docker-host.sh --update [CTID] [--rebuild] [--pull]
 #
 # OVERVIEW
 # --------
@@ -64,12 +68,15 @@
 #   vdi-ctl cf {add|set|remove} <user> [token]
 #   vdi-ctl ttl <user> <days>                                   (0 = never expire)
 #   vdi-ctl reap
+#   vdi-ctl rebuild [--pull]
 #   vdi-ctl api-key
 #   vdi-ctl rotate-api-key
+#   vdi-ctl help
 #
 # REST API ENDPOINTS (Port 8090)
 # ------------------------------
 #   GET    /health           -> Health check (no auth)
+#   GET    /info  (/, /help) -> API & CLI command reference (no auth)
 #   GET    /sessions         -> List active sessions (includes cf_active, ttl_days, expires_at)
 #   POST   /sessions         -> Start session: {"user":"alice","browser":"chrome","cf_token":"...","days":0}
 #   PATCH  /sessions/<user>  -> Day-2 update:  {"password":"...","cf_token":"...","days":2}
@@ -77,7 +84,7 @@
 # ==============================================================================
 set -Eeuo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 SCRIPT_NAME="selkies-docker-host"
 
 if [[ -t 1 ]]; then
@@ -90,8 +97,45 @@ ok()   { printf '%s[✓]%s %s\n' "$C_G" "$C_RST" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_RST" "$*" >&2; }
 die()  { printf '%s[x]%s %s\n' "$C_R" "$C_RST" "$*" >&2; exit 1; }
 
+MODE="install"
+REBUILD_IMAGES=0
+PULL_IMAGES=0
+UPDATE_CTID=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --update)
+      MODE="update"
+      if [[ -n "${2:-}" && "${2:-}" =~ ^[0-9]+$ ]]; then
+        UPDATE_CTID="$2"; shift 2
+      else
+        shift
+      fi
+      ;;
+    --rebuild)
+      REBUILD_IMAGES=1; shift
+      ;;
+    --pull)
+      REBUILD_IMAGES=1; PULL_IMAGES=1; shift
+      ;;
+    -h|--help)
+      cat <<'USAGEEOF'
+Usage:
+  setup-selkies-docker-host.sh                                  Fresh install (interactive)
+  setup-selkies-docker-host.sh --update [CTID]                  Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
+  setup-selkies-docker-host.sh --update [CTID] --rebuild        Also rebuild vcf-* images from pinned base tags
+  setup-selkies-docker-host.sh --update [CTID] --pull           Also pull newest upstream base images and rebuild
+USAGEEOF
+      exit 0
+      ;;
+    *)
+      die "Unknown option: $1 (use --help for usage)"
+      ;;
+  esac
+done
+
 CT_CREATED=0
-CTID=""
+CTID="${UPDATE_CTID}"
 HOST_TMP="$(mktemp -d "/tmp/${SCRIPT_NAME}.XXXXXX")"
 cleanup() { rm -rf "$HOST_TMP"; }
 on_err() {
@@ -140,85 +184,94 @@ ask_secret() {
   printf -v "$__var" '%s' "$__a"
 }
 
-echo "=== ${SCRIPT_NAME} v${VERSION} — Shared Docker Host + REST API for Ephemeral Selkies ==="
+echo "=== ${SCRIPT_NAME} v${VERSION} (${MODE}) — Shared Docker Host + REST API for Ephemeral Selkies ==="
 
-ask CTID     "Host Container ID" "305"
-pct status "$CTID" >/dev/null 2>&1 && die "CTID ${CTID} already exists."
-ask CTNAME   "Host Container hostname" "selkies-vdi-host"
+ask CTID "Host Container ID" "305"
 
-if [[ -z "${STORAGE:-}" ]]; then
-  pvesm status -content rootdir | awk 'NR>1 {printf "  - %-20s %s\n", $1, $2}'
-fi
-ask STORAGE   "Storage pool for rootfs"
-TPL_STORAGE="${TPL_STORAGE:-$(pvesm status -content vztmpl | awk 'NR>1 {print $1; exit}')}"
-
-ask DISK_SIZE "Disk size in GB (holds shared Docker images)" "25"
-ask MEMORY    "Memory in MB (6144 MB fits 3 concurrent users)" "6144"
-ask CORES     "CPU cores" "4"
-
-ask USE_DHCP  "Use DHCP? [y/n]" "y"
-if [[ "$USE_DHCP" =~ ^[Nn]$ ]]; then
-  ask STATIC_IP "Static IP with prefix (e.g. 172.16.0.50/24)"
-  ask STATIC_GW "Gateway"
-  NET_CONFIG="name=eth0,bridge=${BRIDGE:-vmbr0},ip=${STATIC_IP},gw=${STATIC_GW}"
+if [[ "$MODE" == "update" ]]; then
+  pct status "$CTID" >/dev/null 2>&1 || die "CTID ${CTID} does not exist."
+  if ! pct status "$CTID" | grep -q "running"; then
+    log "Starting LXC ${CTID}..."
+    pct start "$CTID"
+    sleep 3
+  fi
 else
-  NET_CONFIG="name=eth0,bridge=${BRIDGE:-vmbr0},ip=dhcp"
-fi
+  pct status "$CTID" >/dev/null 2>&1 && die "CTID ${CTID} already exists. Use --update ${CTID} to upgrade an existing host."
+  ask CTNAME   "Host Container hostname" "selkies-vdi-host"
 
-ask CUSTOM_DNS "DNS server for containers (default lab DNS)" "172.16.0.6"
-DNS_FLAG=(); [[ -n "$CUSTOM_DNS" && "$CUSTOM_DNS" != "none" ]] && DNS_FLAG=(--nameserver "$CUSTOM_DNS")
-ask TIMEZONE   "Timezone" "$(cat /etc/timezone 2>/dev/null || echo Asia/Singapore)"
-ask UI_SCALE   "Browser HiDPI scale (1.0 = native, 1.25 = scaled)" "1.0"
-ask API_PORT   "REST API port" "8090"
-ask_secret CT_PASSWORD "Root password for the Docker host LXC" 8
+  if [[ -z "${STORAGE:-}" ]]; then
+    pvesm status -content rootdir | awk 'NR>1 {printf "  - %-20s %s\n", $1, $2}'
+  fi
+  ask STORAGE   "Storage pool for rootfs"
+  TPL_STORAGE="${TPL_STORAGE:-$(pvesm status -content vztmpl | awk 'NR>1 {print $1; exit}')}"
 
-log "Applying host sysctl tuning..."
-cat > /etc/sysctl.d/99-selkies.conf <<'SYSEOF'
+  ask DISK_SIZE "Disk size in GB (holds shared Docker images)" "25"
+  ask MEMORY    "Memory in MB (6144 MB fits 3 concurrent users)" "6144"
+  ask CORES     "CPU cores" "4"
+
+  ask USE_DHCP  "Use DHCP? [y/n]" "y"
+  if [[ "$USE_DHCP" =~ ^[Nn]$ ]]; then
+    ask STATIC_IP "Static IP with prefix (e.g. 172.16.0.50/24)"
+    ask STATIC_GW "Gateway"
+    NET_CONFIG="name=eth0,bridge=${BRIDGE:-vmbr0},ip=${STATIC_IP},gw=${STATIC_GW}"
+  else
+    NET_CONFIG="name=eth0,bridge=${BRIDGE:-vmbr0},ip=dhcp"
+  fi
+
+  ask CUSTOM_DNS "DNS server for containers (default lab DNS)" "172.16.0.6"
+  DNS_FLAG=(); [[ -n "$CUSTOM_DNS" && "$CUSTOM_DNS" != "none" ]] && DNS_FLAG=(--nameserver "$CUSTOM_DNS")
+  ask TIMEZONE   "Timezone" "$(cat /etc/timezone 2>/dev/null || echo Asia/Singapore)"
+  ask UI_SCALE   "Browser HiDPI scale (1.0 = native, 1.25 = scaled)" "1.0"
+  ask API_PORT   "REST API port" "8090"
+  ask_secret CT_PASSWORD "Root password for the Docker host LXC" 8
+
+  log "Applying host sysctl tuning..."
+  cat > /etc/sysctl.d/99-selkies.conf <<'SYSEOF'
 vm.max_map_count = 262144
 net.core.rmem_max = 26214400
 net.core.wmem_max = 26214400
 SYSEOF
-sysctl --system >/dev/null
+  sysctl --system >/dev/null
 
-pveam update >/dev/null 2>&1 || true
-TEMPLATE="$(pveam available --section system | awk '{print $2}' | grep -E '^debian-12-standard' | sort -V | tail -1)"
-TPL_VOLID="${TPL_STORAGE}:vztmpl/${TEMPLATE##*/}"
-pveam list "$TPL_STORAGE" 2>/dev/null | awk '{print $1}' | grep -qx "$TPL_VOLID" || pveam download "$TPL_STORAGE" "$TEMPLATE"
+  pveam update >/dev/null 2>&1 || true
+  TEMPLATE="$(pveam available --section system | awk '{print $2}' | grep -E '^debian-12-standard' | sort -V | tail -1)"
+  TPL_VOLID="${TPL_STORAGE}:vztmpl/${TEMPLATE##*/}"
+  pveam list "$TPL_STORAGE" 2>/dev/null | awk '{print $1}' | grep -qx "$TPL_VOLID" || pveam download "$TPL_STORAGE" "$TEMPLATE"
 
-STOR_TYPE="$(pvesm status -storage "$STORAGE" | awk 'NR==2 {print $2}')"
-FEATURES="nesting=1,keyctl=1"
-[[ "$STOR_TYPE" == "zfspool" ]] && FEATURES="nesting=1,keyctl=1,fuse=1"
+  STOR_TYPE="$(pvesm status -storage "$STORAGE" | awk 'NR==2 {print $2}')"
+  FEATURES="nesting=1,keyctl=1"
+  [[ "$STOR_TYPE" == "zfspool" ]] && FEATURES="nesting=1,keyctl=1,fuse=1"
 
-log "Creating Docker Host LXC ${CTID} (${STOR_TYPE}, features=${FEATURES})..."
-pct create "$CTID" "$TPL_VOLID" \
-  --ostype debian \
-  --arch amd64 \
-  --hostname "$CTNAME" \
-  --net0 "$NET_CONFIG" \
-  "${DNS_FLAG[@]}" \
-  --storage "$STORAGE" \
-  --rootfs "${STORAGE}:${DISK_SIZE}" \
-  --password "$CT_PASSWORD" \
-  --memory "$MEMORY" \
-  --swap 1024 \
-  --cores "$CORES" \
-  --features "$FEATURES" \
-  --onboot 1 \
-  --tags "docker,selkies,vdi-host" \
-  --unprivileged 1 \
-  --start 0
-CT_CREATED=1
+  log "Creating Docker Host LXC ${CTID} (${STOR_TYPE}, features=${FEATURES})..."
+  pct create "$CTID" "$TPL_VOLID" \
+    --ostype debian \
+    --arch amd64 \
+    --hostname "$CTNAME" \
+    --net0 "$NET_CONFIG" \
+    "${DNS_FLAG[@]}" \
+    --storage "$STORAGE" \
+    --rootfs "${STORAGE}:${DISK_SIZE}" \
+    --password "$CT_PASSWORD" \
+    --memory "$MEMORY" \
+    --swap 1024 \
+    --cores "$CORES" \
+    --features "$FEATURES" \
+    --onboot 1 \
+    --tags "docker,selkies,vdi-host" \
+    --unprivileged 1 \
+    --start 0
+  CT_CREATED=1
 
-pct start "$CTID"
-log "Waiting for LXC networking..."
-for i in $(seq 1 30); do
-  pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1 && break
-  sleep 2
-done
+  pct start "$CTID"
+  log "Waiting for LXC networking..."
+  for i in $(seq 1 30); do
+    pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1 && break
+    sleep 2
+  done
 
-API_KEY="$(dd if=/dev/urandom bs=64 count=1 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-32)"
+  API_KEY="$(dd if=/dev/urandom bs=64 count=1 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-32)"
 
-cat > "${HOST_TMP}/vdi.env" <<ENVEOF
+  cat > "${HOST_TMP}/vdi.env" <<ENVEOF
 LAB_DNS='${CUSTOM_DNS}'
 TIMEZONE='${TIMEZONE}'
 UI_SCALE='${UI_SCALE}'
@@ -226,24 +279,32 @@ VDI_API_PORT='${API_PORT}'
 VDI_API_KEY='${API_KEY}'
 MAX_SESSIONS='3'
 DEFAULT_DAYS='0'
+FIREFOX_BASE='lscr.io/linuxserver/firefox:latest'
+CHROMIUM_BASE='lscr.io/linuxserver/chromium:latest'
+CLOUDFLARED_IMAGE='cloudflare/cloudflared:latest'
 ENVEOF
+fi
 
 cat > "${HOST_TMP}/setup-inside-lxc.sh" <<'INSIDE_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# shellcheck disable=SC1091
-source /root/vdi.env
+MODE="${MODE:-install}"
+REBUILD_IMAGES="${REBUILD_IMAGES:-0}"
+PULL_IMAGES="${PULL_IMAGES:-0}"
 
-apt-get update -qq
-apt-get install -y -qq curl ca-certificates jq iproute2 python3
+if [[ "$MODE" == "install" ]]; then
+  # shellcheck disable=SC1091
+  source /root/vdi.env
+  apt-get update -qq
+  apt-get install -y -qq curl ca-certificates jq iproute2 python3
 
-# 1. Install Docker Engine
-curl -fsSL https://get.docker.com | sh
+  # 1. Install Docker Engine
+  curl -fsSL https://get.docker.com | sh
 
-# 2. Harden Docker daemon: isolate containers from each other (icc=false)
-cat > /etc/docker/daemon.json <<'JSONEOF'
+  # 2. Harden Docker daemon: isolate containers from each other (icc=false)
+  cat > /etc/docker/daemon.json <<'JSONEOF'
 {
   "icc": false,
   "live-restore": true,
@@ -254,14 +315,37 @@ cat > /etc/docker/daemon.json <<'JSONEOF'
   }
 }
 JSONEOF
-systemctl restart docker
+  systemctl restart docker
+else
+  # Update mode: back up existing scripts and preserve /etc/vdi-ctl.conf
+  BACKUP_DIR="/var/backups/vdi/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+  [[ -f /usr/local/bin/vdi-ctl ]] && cp /usr/local/bin/vdi-ctl "$BACKUP_DIR/"
+  [[ -f /usr/local/bin/vdi-api.py ]] && cp /usr/local/bin/vdi-api.py "$BACKUP_DIR/"
+
+  touch /etc/vdi-ctl.conf
+  chmod 600 /etc/vdi-ctl.conf
+  ensure_conf() {
+    grep -q "^${1}=" /etc/vdi-ctl.conf || echo "${1}='${2}'" >> /etc/vdi-ctl.conf
+  }
+  ensure_conf UI_SCALE "1.0"
+  ensure_conf VDI_API_PORT "8090"
+  ensure_conf MAX_SESSIONS "3"
+  ensure_conf DEFAULT_DAYS "0"
+  ensure_conf FIREFOX_BASE "lscr.io/linuxserver/firefox:latest"
+  ensure_conf CHROMIUM_BASE "lscr.io/linuxserver/chromium:latest"
+  ensure_conf CLOUDFLARED_IMAGE "cloudflare/cloudflared:latest"
+  # shellcheck disable=SC1091
+  source /etc/vdi-ctl.conf
+fi
 
 # 3. Stage Dockerfiles for both Firefox (default) and Chromium (on-demand)
 mkdir -p /opt/vcf-firefox/certs /opt/vcf-firefox/bin \
          /opt/vcf-chromium/certs /opt/vcf-chromium/bin
 
 cat > /opt/vcf-firefox/Dockerfile <<DOCKEREOF
-FROM lscr.io/linuxserver/firefox:latest
+ARG BASE_IMAGE=lscr.io/linuxserver/firefox:latest
+FROM \${BASE_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl jq unzip openssh-client iputils-ping dnsutils ca-certificates tmux nano less apache2-utils \
@@ -296,7 +380,7 @@ RUN mkdir -p /usr/lib/firefox/defaults/pref && \
       > /usr/lib/firefox/defaults/pref/local-settings.js && \
     cat << 'CFGEOF' > /usr/lib/firefox/vcf.cfg
 pref("browser.aboutConfig.showWarning", false);
-pref("layout.css.devPixelsPerPx", "${UI_SCALE}");
+pref("layout.css.devPixelsPerPx", "${UI_SCALE:-1.0}");
 pref("browser.sessionstore.resume_from_crash", false);
 pref("browser.shell.checkDefaultBrowser", false);
 pref("browser.tabs.warnOnClose", false);
@@ -306,7 +390,8 @@ CFGEOF
 DOCKEREOF
 
 cat > /opt/vcf-chromium/Dockerfile <<'DOCKEREOF'
-FROM lscr.io/linuxserver/chromium:latest
+ARG BASE_IMAGE=lscr.io/linuxserver/chromium:latest
+FROM ${BASE_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl jq unzip openssh-client iputils-ping dnsutils ca-certificates tmux nano less apache2-utils \
@@ -327,7 +412,20 @@ RUN mkdir -p /etc/chromium/policies/managed && \
 POLEOF
 DOCKEREOF
 
-docker build -t vcf-firefox:latest /opt/vcf-firefox
+if [[ "$MODE" == "install" || "$REBUILD_IMAGES" == "1" ]]; then
+  PULL_ARG=()
+  [[ "$PULL_IMAGES" == "1" ]] && PULL_ARG=(--pull)
+  docker build "${PULL_ARG[@]}" --build-arg "BASE_IMAGE=${FIREFOX_BASE:-lscr.io/linuxserver/firefox:latest}" \
+    -t vcf-firefox:latest /opt/vcf-firefox
+  if [[ "$MODE" == "update" ]] && docker image inspect vcf-chromium:latest >/dev/null 2>&1; then
+    docker build "${PULL_ARG[@]}" --build-arg "BASE_IMAGE=${CHROMIUM_BASE:-lscr.io/linuxserver/chromium:latest}" \
+      -t vcf-chromium:latest /opt/vcf-chromium
+  fi
+  if [[ "$PULL_IMAGES" == "1" ]]; then
+    docker pull "${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}" >/dev/null
+  fi
+  docker image prune -f >/dev/null 2>&1 || true
+fi
 
 # 4. Install vdi-ctl session manager CLI
 cat > /usr/local/bin/vdi-ctl <<'CTLEOF'
@@ -342,6 +440,9 @@ MAX_SESSIONS="${MAX_SESSIONS:-3}"
 DEFAULT_DAYS="${DEFAULT_DAYS:-0}"
 LAB_DNS="${LAB_DNS:-172.16.0.6}"
 TIMEZONE="${TIMEZONE:-Asia/Singapore}"
+FIREFOX_BASE="${FIREFOX_BASE:-lscr.io/linuxserver/firefox:latest}"
+CHROMIUM_BASE="${CHROMIUM_BASE:-lscr.io/linuxserver/chromium:latest}"
+CLOUDFLARED_IMAGE="${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
 STATE_DIR="/var/lib/vdi/sessions"
 mkdir -p "$STATE_DIR"
 
@@ -402,7 +503,7 @@ start_cf_sidecar() {
     --cpus=0.5 \
     --label "app=vcf-selkies-cf" \
     --label "vdi.user=${user}" \
-    cloudflare/cloudflared:latest \
+    "$CLOUDFLARED_IMAGE" \
     tunnel --no-autoupdate run --token "$cf_token" >/dev/null
 }
 
@@ -423,7 +524,7 @@ ensure_image() {
   if [[ "$browser" == "chrome" ]]; then
     if ! docker image inspect vcf-chromium:latest >/dev/null 2>&1; then
       echo "[+] First-time Chromium request: building vcf-chromium:latest..."
-      docker build -t vcf-chromium:latest /opt/vcf-chromium >/dev/null
+      docker build --build-arg "BASE_IMAGE=${CHROMIUM_BASE}" -t vcf-chromium:latest /opt/vcf-chromium >/dev/null
     fi
     echo "vcf-chromium:latest"
   else
@@ -647,6 +748,75 @@ cmd_rotate_api_key() {
   echo "Rotated VDI_API_KEY: ${new_key}"
 }
 
+cmd_rebuild() {
+  local pull_arg=() pull_flag=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pull) pull_flag=1; pull_arg=(--pull); shift ;;
+      *) echo "Usage: vdi-ctl rebuild [--pull]" >&2; exit 1 ;;
+    esac
+  done
+  echo "[+] Rebuilding vcf-firefox:latest (base: ${FIREFOX_BASE})..."
+  docker build "${pull_arg[@]}" --build-arg "BASE_IMAGE=${FIREFOX_BASE}" -t vcf-firefox:latest /opt/vcf-firefox
+  if docker image inspect vcf-chromium:latest >/dev/null 2>&1; then
+    echo "[+] Rebuilding vcf-chromium:latest (base: ${CHROMIUM_BASE})..."
+    docker build "${pull_arg[@]}" --build-arg "BASE_IMAGE=${CHROMIUM_BASE}" -t vcf-chromium:latest /opt/vcf-chromium
+  fi
+  if [[ "$pull_flag" == "1" ]]; then
+    echo "[+] Pulling ${CLOUDFLARED_IMAGE}..."
+    docker pull "$CLOUDFLARED_IMAGE" >/dev/null
+  fi
+  docker image prune -f >/dev/null 2>&1 || true
+  echo "[✓] Image rebuild complete (running sessions untouched; new sessions will use updated images)."
+}
+
+cmd_help() {
+  cat <<'HELPEOF'
+vdi-ctl — Selkies Ephemeral VDI Session Manager
+
+Session Lifecycle:
+  vdi-ctl start <user> [--chrome] [-cf <token>] [--days <N>]
+      Start a Firefox (default) or Chromium session.
+      --days <N> : Auto-expire after N days (default: 0 = never expire)
+      -cf <tok>  : Attach a Cloudflare Tunnel sidecar on start
+  vdi-ctl stop <user>
+      Stop and wipe session + CF sidecar for <user>
+  vdi-ctl list
+      List active sessions (browser, port, CF status, TTL days, expiry)
+
+Day-2 Operations:
+  vdi-ctl passwd <user> [new_password]
+      Change session password live (auto-generates if omitted)
+  vdi-ctl cf add <user> <token>
+      Attach a Cloudflare Tunnel sidecar to a running session
+  vdi-ctl cf set <user> <token>
+      Add or replace the Cloudflare Tunnel token live (zero downtime)
+  vdi-ctl cf remove <user>
+      Remove Cloudflare Tunnel sidecar (LAN access remains active)
+  vdi-ctl ttl <user> <days>
+      Update session expiry to <days> from now (0 = never expire)
+  vdi-ctl reap
+      Stop any expired sessions (runs every 5m via vdi-reaper.timer)
+  vdi-ctl rebuild [--pull]
+      Rebuild vcf-firefox (and vcf-chromium if present) from pinned base tags
+      in /etc/vdi-ctl.conf. Pass --pull to fetch newest upstream images.
+
+Host Updates (run on Proxmox host):
+  setup-selkies-docker-host.sh --update [CTID] [--rebuild | --pull]
+      --update           : Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
+      --update --rebuild : Also rebuild vcf-* images from pinned base tags
+      --update --pull    : Also pull newest upstream images and rebuild
+
+API Key & Help:
+  vdi-ctl api-key
+      Print the current REST API Bearer token
+  vdi-ctl rotate-api-key
+      Generate a new REST API Bearer token and restart vdi-api
+  vdi-ctl help
+      Show this help message
+HELPEOF
+}
+
 case "${1:-}" in
   start)          shift; cmd_start "$@" ;;
   stop)           cmd_stop "${2:-}" ;;
@@ -655,17 +825,18 @@ case "${1:-}" in
   cf)             shift; cmd_cf "$@" ;;
   ttl)            cmd_ttl "${2:-}" "${3:-}" ;;
   reap)           cmd_reap ;;
+  rebuild)        shift; cmd_rebuild "$@" ;;
   api-key)        cmd_api_key ;;
   rotate-api-key) cmd_rotate_api_key ;;
-  *)
-    echo "Usage: vdi-ctl {start <user> [--chrome] [-cf <token>] [--days <N>] | stop <user> | list | passwd <user> [pass] | cf {add|set|remove} <user> [token] | ttl <user> <days> | reap | api-key | rotate-api-key}" >&2
-    exit 1
-    ;;
+  help|-h|--help) cmd_help ;;
+  *)              cmd_help >&2; exit 1 ;;
 esac
 CTLEOF
 chmod +x /usr/local/bin/vdi-ctl
-mv /root/vdi.env /etc/vdi-ctl.conf
-chmod 600 /etc/vdi-ctl.conf
+if [[ "$MODE" == "install" ]]; then
+  mv /root/vdi.env /etc/vdi-ctl.conf
+  chmod 600 /etc/vdi-ctl.conf
+fi
 
 # 5. Install lightweight Python stdlib REST API daemon
 cat > /usr/local/bin/vdi-api.py <<'APIEOF'
@@ -714,6 +885,31 @@ class VDIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._send(200, {"status": "ok"})
+        if self.path in ("/", "/info", "/help"):
+            return self._send(200, {
+                "service": "selkies-vdi-api",
+                "auth": "Authorization: Bearer <VDI_API_KEY> (retrieve via 'vdi-ctl api-key')",
+                "defaults": {
+                    "browser": "firefox",
+                    "days": int(os.environ.get("DEFAULT_DAYS", "0")),
+                    "max_sessions": int(os.environ.get("MAX_SESSIONS", "3")),
+                },
+                "endpoints": {
+                    "GET /health": "Health check (no auth)",
+                    "GET /info": "This API & CLI reference (no auth; aliases: /, /help)",
+                    "GET /sessions": "List active sessions (cf_active, ttl_days, expires_at)",
+                    "POST /sessions": {
+                        "description": "Start a new ephemeral session",
+                        "body": {"user": "alice", "browser": "firefox|chrome", "cf_token": "optional", "days": 0},
+                    },
+                    "PATCH /sessions/<user>": {
+                        "description": "Day-2 updates on a running session (any subset of fields)",
+                        "body": {"password": "optional (empty = auto-gen)", "cf_token": "token or null to remove", "days": "int >= 0 (0 = never expire)"},
+                    },
+                    "DELETE /sessions/<user>": "Stop and wipe a session",
+                },
+                "cli": "Run 'vdi-ctl help' on the Proxmox host or inside the LXC for CLI commands (includes rebuild [--pull] and --update [--rebuild|--pull])",
+            })
         if not self._auth():
             return self._send(401, {"error": "unauthorized"})
         if self.path == "/sessions":
@@ -909,12 +1105,19 @@ TIMEREOF
 
 systemctl daemon-reload
 systemctl enable --now vdi-api vdi-reaper.timer
+if [[ "$MODE" == "update" ]]; then
+  systemctl restart vdi-api
+fi
 INSIDE_EOF
 
-pct push "$CTID" "${HOST_TMP}/vdi.env" /root/vdi.env --perms 600
 pct push "$CTID" "${HOST_TMP}/setup-inside-lxc.sh" /root/setup-inside-lxc.sh --perms 700
-log "Installing Docker, REST API, and building shared vcf-firefox image inside LXC ${CTID}..."
-pct exec "$CTID" -- /root/setup-inside-lxc.sh
+if [[ "$MODE" == "install" ]]; then
+  pct push "$CTID" "${HOST_TMP}/vdi.env" /root/vdi.env --perms 600
+  log "Installing Docker, REST API, and building shared vcf-firefox image inside LXC ${CTID}..."
+else
+  log "Updating LXC ${CTID} (rebuild=${REBUILD_IMAGES}, pull=${PULL_IMAGES}; running sessions untouched)..."
+fi
+pct exec "$CTID" -- env MODE="$MODE" REBUILD_IMAGES="$REBUILD_IMAGES" PULL_IMAGES="$PULL_IMAGES" /root/setup-inside-lxc.sh
 pct exec "$CTID" -- rm -f /root/setup-inside-lxc.sh
 
 cat > /usr/local/bin/vdi-ctl <<WRAPEOF
@@ -924,12 +1127,21 @@ WRAPEOF
 chmod +x /usr/local/bin/vdi-ctl
 
 HOST_IP="$(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
+API_PORT="$(pct exec "$CTID" -- bash -c "source /etc/vdi-ctl.conf && echo \${VDI_API_PORT:-8090}")"
 echo
 echo "========================================================"
-ok "Shared Selkies Docker Host + REST API ready on LXC ${CTID}"
-echo "--------------------------------------------------------"
-echo "  REST Endpoint : http://${HOST_IP}:${API_PORT}"
-echo "  Bearer Token  : ${API_KEY}"
-echo "  Start (REST)  : curl -X POST http://${HOST_IP}:${API_PORT}/sessions -H 'Authorization: Bearer ${API_KEY}' -d '{\"user\":\"alice\"}'"
-echo "  CLI Shortcut  : vdi-ctl {start <user> [--chrome] [-cf <token>] [--days <N>] | stop <user> | list | passwd <user> [pass] | cf {add|set|remove} <user> [token] | ttl <user> <days> | api-key | rotate-api-key}"
+if [[ "$MODE" == "update" ]]; then
+  ok "Updated Selkies Docker Host + REST API on LXC ${CTID} (v${VERSION})"
+  echo "--------------------------------------------------------"
+  echo "  REST Endpoint : http://${HOST_IP}:${API_PORT}"
+  echo "  Bearer Token  : (preserved — run 'vdi-ctl api-key' to view)"
+  echo "  CLI Help      : vdi-ctl help"
+else
+  ok "Shared Selkies Docker Host + REST API ready on LXC ${CTID}"
+  echo "--------------------------------------------------------"
+  echo "  REST Endpoint : http://${HOST_IP}:${API_PORT}"
+  echo "  Bearer Token  : ${API_KEY}"
+  echo "  Start (REST)  : curl -X POST http://${HOST_IP}:${API_PORT}/sessions -H 'Authorization: Bearer ${API_KEY}' -d '{\"user\":\"alice\"}'"
+  echo "  CLI Shortcut  : vdi-ctl {start <user> [--chrome] [-cf <token>] [--days <N>] | stop <user> | list | passwd <user> [pass] | cf {add|set|remove} <user> [token] | ttl <user> <days> | rebuild [--pull] | api-key | rotate-api-key | help}"
+fi
 echo "========================================================"

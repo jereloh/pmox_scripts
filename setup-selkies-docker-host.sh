@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.3)
+# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.4)
 # ==============================================================================
 #
 # Usage:
@@ -85,7 +85,7 @@
 # ==============================================================================
 set -Eeuo pipefail
 
-VERSION="1.3"
+VERSION="1.4"
 SCRIPT_NAME="selkies-docker-host"
 
 if [[ -t 1 ]]; then
@@ -370,7 +370,7 @@ RUN mkdir -p /usr/lib/firefox/distribution && \
     "Homepage": { "URL": "about:blank", "StartPage": "homepage" },
     "ManagedBookmarks": [
       { "toplevel_name": "Lab Resources" },
-      { "name": "Home", "url": "https://home.lab.sg" },
+      { "name": "Home", "url": "https://home.lab.sg" }
     ]
   }
 }
@@ -407,7 +407,7 @@ RUN mkdir -p /etc/chromium/policies/managed && \
   "DnsOverHttpsMode": "off",
   "ManagedBookmarks": [
     { "toplevel_name": "Lab Resources" },
-    { "name": "Home", "url": "https://home.lab.sg" },
+    { "name": "Home", "url": "https://home.lab.sg" }
   ]
 }
 POLEOF

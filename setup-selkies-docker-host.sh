@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.2)
+# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.3)
 # ==============================================================================
 #
 # Usage:
@@ -78,13 +78,14 @@
 #   GET    /health           -> Health check (no auth)
 #   GET    /info  (/, /help) -> API & CLI command reference (no auth)
 #   GET    /sessions         -> List active sessions (includes cf_active, ttl_days, expires_at)
-#   POST   /sessions         -> Start session: {"user":"alice","browser":"chrome","cf_token":"...","days":0}
-#   PATCH  /sessions/<user>  -> Day-2 update:  {"password":"...","cf_token":"...","days":2}
-#   DELETE /sessions/<user>  -> Stop and wipe session
+#   POST   /sessions                -> Start session: {"user":"alice","browser":"chrome","cf_token":"...","days":0}
+#   POST   /sessions/<user>/password -> Change password (requires {"password":"..."})
+#   PATCH  /sessions/<user>         -> Day-2 update:  {"password":"...","cf_token":"...","days":2}
+#   DELETE /sessions/<user>         -> Stop and wipe session
 # ==============================================================================
 set -Eeuo pipefail
 
-VERSION="1.2"
+VERSION="1.3"
 SCRIPT_NAME="selkies-docker-host"
 
 if [[ -t 1 ]]; then
@@ -496,7 +497,8 @@ format_expiry() {
 
 start_cf_sidecar() {
   local user="$1" cf_token="$2"
-  docker run -d --rm \
+  docker rm -f "cf-${user}" >/dev/null 2>&1 || true
+  docker run -d --restart unless-stopped \
     --name "cf-${user}" \
     --network "container:selkies-${user}" \
     --memory=128m \
@@ -584,7 +586,8 @@ cmd_start() {
   host_ip=$(hostname -I | awk '{print $1}')
   [[ -n "$LAB_DNS" && "$LAB_DNS" != "none" ]] && dns_args=(--dns "$LAB_DNS")
 
-  docker run -d --rm \
+  docker rm -f "cf-${user}" "$cname" >/dev/null 2>&1 || true
+  docker run -d --restart unless-stopped \
     --name "$cname" \
     --hostname "vcf-${browser}-${user}" \
     --shm-size=1gb \
@@ -631,8 +634,8 @@ cmd_start() {
 
 cmd_stop() {
   local user="${1:?Usage: vdi-ctl stop <username>}"
-  docker stop "cf-${user}" >/dev/null 2>&1 || true
-  docker stop "selkies-${user}" >/dev/null
+  docker rm -f "cf-${user}" >/dev/null 2>&1 || true
+  docker rm -f "selkies-${user}" >/dev/null
   rm -f "${STATE_DIR}/${user}.env"
   echo "Stopped and wiped ephemeral session for '${user}'."
 }
@@ -664,7 +667,16 @@ cmd_passwd() {
     set -e
     htfile="/config/.htpasswd"
     [[ -f /etc/nginx/.htpasswd && ! -f /config/.htpasswd ]] && htfile="/etc/nginx/.htpasswd"
-    htpasswd -bc "$htfile" "$VDI_USER" "$VDI_PASS" >/dev/null 2>&1
+    hash_line=$(htpasswd -nb "$VDI_USER" "$VDI_PASS")
+    printf "%s\n" "$hash_line" > "$htfile"
+    chmod 644 "$htfile"
+    mkdir -p /custom-cont-init.d
+    cat > /custom-cont-init.d/99-vdi-passwd <<HOOK
+#!/usr/bin/env bash
+printf "%s\n" '\''${hash_line}'\'' > "${htfile}"
+chmod 644 "${htfile}"
+HOOK
+    chmod +x /custom-cont-init.d/99-vdi-passwd
     nginx -s reload >/dev/null 2>&1 || true
   '
   echo "=========================================="
@@ -690,12 +702,11 @@ cmd_cf() {
       ;;
     set)
       [[ -n "$token" ]] || { echo "Usage: vdi-ctl cf set <username> <token>" >&2; exit 1; }
-      docker stop "cf-${user}" >/dev/null 2>&1 || true
       start_cf_sidecar "$user" "$token"
       echo "CF Tunnel: Attached (cf-${user} -> https://localhost:3001)"
       ;;
     remove|rm)
-      docker stop "cf-${user}" >/dev/null 2>&1 || true
+      docker rm -f "cf-${user}" >/dev/null 2>&1 || true
       echo "CF Tunnel: Removed for '${user}' (LAN access remains active)."
       ;;
     *)
@@ -902,6 +913,10 @@ class VDIHandler(BaseHTTPRequestHandler):
                         "description": "Start a new ephemeral session",
                         "body": {"user": "alice", "browser": "firefox|chrome", "cf_token": "optional", "days": 0},
                     },
+                    "POST /sessions/<user>/password": {
+                        "description": "Change password on a running session (only when password is provided)",
+                        "body": {"password": "required (min 8 chars)"},
+                    },
                     "PATCH /sessions/<user>": {
                         "description": "Day-2 updates on a running session (any subset of fields)",
                         "body": {"password": "optional (empty = auto-gen)", "cf_token": "token or null to remove", "days": "int >= 0 (0 = never expire)"},
@@ -944,6 +959,23 @@ class VDIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth():
             return self._send(401, {"error": "unauthorized"})
+
+        if self.path.startswith("/sessions/") and self.path.endswith("/password"):
+            user = self.path[len("/sessions/"):-len("/password")]
+            if not USER_RE.match(user):
+                return self._send(400, {"error": "invalid user"})
+            try:
+                data = self._read_json()
+            except json.JSONDecodeError:
+                return self._send(400, {"error": "invalid json"})
+            pw = data.get("password")
+            if not isinstance(pw, str) or len(pw) < 8:
+                return self._send(400, {"error": "password is required (min 8 characters)"})
+            res = subprocess.run(["/usr/local/bin/vdi-ctl", "passwd", user, pw], capture_output=True, text=True)
+            if res.returncode != 0:
+                return self._send(404, {"error": res.stderr.strip() or "password update failed"})
+            return self._send(200, {"status": "updated", "user": user, "password": pw})
+
         if self.path != "/sessions":
             return self._send(404, {"error": "not found"})
 

@@ -593,7 +593,6 @@ cmd_start() {
     --shm-size=1gb \
     --memory=1800m \
     --cpus=2 \
-    --tmpfs /config/Downloads:rw,noexec,nosuid,size=512m \
     "${dns_args[@]}" \
     -e PUID=1000 \
     -e PGID=1000 \

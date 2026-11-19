@@ -591,7 +591,7 @@ cmd_start() {
     --name "$cname" \
     --hostname "vcf-${browser}-${user}" \
     --shm-size=1gb \
-    --memory=1800m \
+    --memory=3072m \
     --cpus=2 \
     "${dns_args[@]}" \
     -e PUID=1000 \

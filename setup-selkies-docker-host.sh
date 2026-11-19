@@ -282,6 +282,7 @@ MAX_SESSIONS='3'
 DEFAULT_DAYS='0'
 FIREFOX_BASE='lscr.io/linuxserver/firefox:latest'
 CHROMIUM_BASE='lscr.io/linuxserver/chromium:latest'
+CHROME_BASE='lscr.io/linuxserver/chrome:latest'
 CLOUDFLARED_IMAGE='cloudflare/cloudflared:latest'
 ENVEOF
 fi
@@ -335,14 +336,16 @@ else
   ensure_conf DEFAULT_DAYS "0"
   ensure_conf FIREFOX_BASE "lscr.io/linuxserver/firefox:latest"
   ensure_conf CHROMIUM_BASE "lscr.io/linuxserver/chromium:latest"
+  ensure_conf CHROME_BASE "lscr.io/linuxserver/chrome:latest"
   ensure_conf CLOUDFLARED_IMAGE "cloudflare/cloudflared:latest"
   # shellcheck disable=SC1091
   source /etc/vdi-ctl.conf
 fi
 
-# 3. Stage Dockerfiles for both Firefox (default) and Chromium (on-demand)
+# 3. Stage Dockerfiles for Firefox (default), Chromium (on-demand), and Chrome (on-demand)
 mkdir -p /opt/vcf-firefox/certs /opt/vcf-firefox/bin \
-         /opt/vcf-chromium/certs /opt/vcf-chromium/bin
+         /opt/vcf-chromium/certs /opt/vcf-chromium/bin \
+         /opt/vcf-chrome/certs /opt/vcf-chrome/bin
 
 cat > /opt/vcf-firefox/Dockerfile <<DOCKEREOF
 ARG BASE_IMAGE=lscr.io/linuxserver/firefox:latest
@@ -413,6 +416,29 @@ RUN mkdir -p /etc/chromium/policies/managed && \
 POLEOF
 DOCKEREOF
 
+cat > /opt/vcf-chrome/Dockerfile <<'DOCKEREOF'
+ARG BASE_IMAGE=lscr.io/linuxserver/chrome:latest
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq unzip openssh-client iputils-ping dnsutils ca-certificates tmux nano less apache2-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/opt/chrome/policies/managed && \
+    cat << 'POLEOF' > /etc/opt/chrome/policies/managed/vcf-lab.json
+{
+  "BookmarkBarEnabled": true,
+  "DefaultBrowserSettingEnabled": false,
+  "MetricsReportingEnabled": false,
+  "DnsOverHttpsMode": "off",
+  "ManagedBookmarks": [
+    { "toplevel_name": "Lab Resources" },
+    { "name": "Home", "url": "https://home.lab.sg" }
+  ]
+}
+POLEOF
+DOCKEREOF
+
 if [[ "$MODE" == "install" || "$REBUILD_IMAGES" == "1" ]]; then
   PULL_ARG=()
   [[ "$PULL_IMAGES" == "1" ]] && PULL_ARG=(--pull)
@@ -421,6 +447,10 @@ if [[ "$MODE" == "install" || "$REBUILD_IMAGES" == "1" ]]; then
   if [[ "$MODE" == "update" ]] && docker image inspect vcf-chromium:latest >/dev/null 2>&1; then
     docker build "${PULL_ARG[@]}" --build-arg "BASE_IMAGE=${CHROMIUM_BASE:-lscr.io/linuxserver/chromium:latest}" \
       -t vcf-chromium:latest /opt/vcf-chromium
+  fi
+  if [[ "$MODE" == "update" ]] && docker image inspect vcf-chrome:latest >/dev/null 2>&1; then
+    docker build "${PULL_ARG[@]}" --build-arg "BASE_IMAGE=${CHROME_BASE:-lscr.io/linuxserver/chrome:latest}" \
+      -t vcf-chrome:latest /opt/vcf-chrome
   fi
   if [[ "$PULL_IMAGES" == "1" ]]; then
     docker pull "${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}" >/dev/null
@@ -443,6 +473,7 @@ LAB_DNS="${LAB_DNS:-172.16.0.6}"
 TIMEZONE="${TIMEZONE:-Asia/Singapore}"
 FIREFOX_BASE="${FIREFOX_BASE:-lscr.io/linuxserver/firefox:latest}"
 CHROMIUM_BASE="${CHROMIUM_BASE:-lscr.io/linuxserver/chromium:latest}"
+CHROME_BASE="${CHROME_BASE:-lscr.io/linuxserver/chrome:latest}"
 CLOUDFLARED_IMAGE="${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
 STATE_DIR="/var/lib/vdi/sessions"
 mkdir -p "$STATE_DIR"
@@ -523,23 +554,34 @@ find_free_port() {
 
 ensure_image() {
   local browser="$1"
-  if [[ "$browser" == "chrome" ]]; then
-    if ! docker image inspect vcf-chromium:latest >/dev/null 2>&1; then
-      echo "[+] First-time Chromium request: building vcf-chromium:latest..."
-      docker build --build-arg "BASE_IMAGE=${CHROMIUM_BASE}" -t vcf-chromium:latest /opt/vcf-chromium >/dev/null
-    fi
-    echo "vcf-chromium:latest"
-  else
-    echo "vcf-firefox:latest"
-  fi
+  case "$browser" in
+    chrome)
+      if ! docker image inspect vcf-chrome:latest >/dev/null 2>&1; then
+        echo "[+] First-time Chrome request: building vcf-chrome:latest..." >&2
+        docker build --build-arg "BASE_IMAGE=${CHROME_BASE}" -t vcf-chrome:latest /opt/vcf-chrome >/dev/null
+      fi
+      echo "vcf-chrome:latest"
+      ;;
+    chromium)
+      if ! docker image inspect vcf-chromium:latest >/dev/null 2>&1; then
+        echo "[+] First-time Chromium request: building vcf-chromium:latest..." >&2
+        docker build --build-arg "BASE_IMAGE=${CHROMIUM_BASE}" -t vcf-chromium:latest /opt/vcf-chromium >/dev/null
+      fi
+      echo "vcf-chromium:latest"
+      ;;
+    *)
+      echo "vcf-firefox:latest"
+      ;;
+  esac
 }
 
 cmd_start() {
   local user="" browser="firefox" cf_token="" days="$DEFAULT_DAYS"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --chrome|--chromium) browser="chrome"; shift ;;
-      --firefox|-ff)       browser="firefox"; shift ;;
+      --chrome)       browser="chrome"; shift ;;
+      --chromium)     browser="chromium"; shift ;;
+      --firefox|-ff)  browser="firefox"; shift ;;
       -cf|--cf)
         cf_token="${2:?Error: -cf requires a Cloudflare Tunnel token}"
         shift 2
@@ -561,7 +603,7 @@ cmd_start() {
     esac
   done
 
-  [[ -n "$user" ]] || { echo "Usage: vdi-ctl start <username> [--chrome] [-cf <token>] [--days <N>]" >&2; exit 1; }
+  [[ -n "$user" ]] || { echo "Usage: vdi-ctl start <username> [--chrome | --chromium | --firefox] [-cf <token>] [--days <N>]" >&2; exit 1; }
   validate_days "$days"
   local cname="selkies-${user}"
 
@@ -579,12 +621,13 @@ cmd_start() {
     exit 1
   fi
 
-  local image port pass host_ip dns_args=()
+  local image port pass host_ip dns_args=() seccomp_args=()
   image=$(ensure_image "$browser")
   port=$(find_free_port) || { echo "Error: No free ports available." >&2; exit 1; }
   pass=$(gen_secret 16)
   host_ip=$(hostname -I | awk '{print $1}')
   [[ -n "$LAB_DNS" && "$LAB_DNS" != "none" ]] && dns_args=(--dns "$LAB_DNS")
+  [[ "$browser" == "chrome" ]] && seccomp_args=(--security-opt seccomp=unconfined)
 
   docker rm -f "cf-${user}" "$cname" >/dev/null 2>&1 || true
   docker run -d --restart unless-stopped \
@@ -593,6 +636,7 @@ cmd_start() {
     --shm-size=1gb \
     --memory=3072m \
     --cpus=2 \
+    "${seccomp_args[@]}" \
     "${dns_args[@]}" \
     -e PUID=1000 \
     -e PGID=1000 \
@@ -772,6 +816,10 @@ cmd_rebuild() {
     echo "[+] Rebuilding vcf-chromium:latest (base: ${CHROMIUM_BASE})..."
     docker build "${pull_arg[@]}" --build-arg "BASE_IMAGE=${CHROMIUM_BASE}" -t vcf-chromium:latest /opt/vcf-chromium
   fi
+  if docker image inspect vcf-chrome:latest >/dev/null 2>&1; then
+    echo "[+] Rebuilding vcf-chrome:latest (base: ${CHROME_BASE})..."
+    docker build "${pull_arg[@]}" --build-arg "BASE_IMAGE=${CHROME_BASE}" -t vcf-chrome:latest /opt/vcf-chrome
+  fi
   if [[ "$pull_flag" == "1" ]]; then
     echo "[+] Pulling ${CLOUDFLARED_IMAGE}..."
     docker pull "$CLOUDFLARED_IMAGE" >/dev/null
@@ -785,8 +833,8 @@ cmd_help() {
 vdi-ctl — Selkies Ephemeral VDI Session Manager
 
 Session Lifecycle:
-  vdi-ctl start <user> [--chrome] [-cf <token>] [--days <N>]
-      Start a Firefox (default) or Chromium session.
+  vdi-ctl start <user> [--chrome | --chromium | --firefox] [-cf <token>] [--days <N>]
+      Start a Firefox (default), Chromium, or Google Chrome session.
       --days <N> : Auto-expire after N days (default: 0 = never expire)
       -cf <tok>  : Attach a Cloudflare Tunnel sidecar on start
   vdi-ctl stop <user>
@@ -808,7 +856,7 @@ Day-2 Operations:
   vdi-ctl reap
       Stop any expired sessions (runs every 5m via vdi-reaper.timer)
   vdi-ctl rebuild [--pull]
-      Rebuild vcf-firefox (and vcf-chromium if present) from pinned base tags
+      Rebuild vcf-firefox (and vcf-chromium / vcf-chrome if present) from pinned base tags
       in /etc/vdi-ctl.conf. Pass --pull to fetch newest upstream images.
 
 Host Updates (run on Proxmox host):
@@ -910,7 +958,7 @@ class VDIHandler(BaseHTTPRequestHandler):
                     "GET /sessions": "List active sessions (cf_active, ttl_days, expires_at)",
                     "POST /sessions": {
                         "description": "Start a new ephemeral session",
-                        "body": {"user": "alice", "browser": "firefox|chrome", "cf_token": "optional", "days": 0},
+                        "body": {"user": "alice", "browser": "firefox|chromium|chrome", "cf_token": "optional", "days": 0},
                     },
                     "POST /sessions/<user>/password": {
                         "description": "Change password on a running session (only when password is provided)",
@@ -990,8 +1038,8 @@ class VDIHandler(BaseHTTPRequestHandler):
 
         if not USER_RE.match(user):
             return self._send(400, {"error": "invalid user (alphanumeric, 1-32 chars)"})
-        if browser not in ("firefox", "chrome"):
-            return self._send(400, {"error": "browser must be firefox or chrome"})
+        if browser not in ("firefox", "chromium", "chrome"):
+            return self._send(400, {"error": "browser must be firefox, chromium, or chrome"})
         if cf_token and not TOKEN_RE.match(cf_token):
             return self._send(400, {"error": "invalid cf_token format"})
         if days is not None and (not isinstance(days, int) or isinstance(days, bool) or days < 0):
@@ -1000,6 +1048,8 @@ class VDIHandler(BaseHTTPRequestHandler):
         cmd = ["/usr/local/bin/vdi-ctl", "start", user]
         if browser == "chrome":
             cmd.append("--chrome")
+        elif browser == "chromium":
+            cmd.append("--chromium")
         if cf_token:
             cmd.extend(["-cf", cf_token])
         if days is not None:
@@ -1173,6 +1223,6 @@ else
   echo "  REST Endpoint : http://${HOST_IP}:${API_PORT}"
   echo "  Bearer Token  : ${API_KEY}"
   echo "  Start (REST)  : curl -X POST http://${HOST_IP}:${API_PORT}/sessions -H 'Authorization: Bearer ${API_KEY}' -d '{\"user\":\"alice\"}'"
-  echo "  CLI Shortcut  : vdi-ctl {start <user> [--chrome] [-cf <token>] [--days <N>] | stop <user> | list | passwd <user> [pass] | cf {add|set|remove} <user> [token] | ttl <user> <days> | rebuild [--pull] | api-key | rotate-api-key | help}"
+  echo "  CLI Shortcut  : vdi-ctl {start <user> [--chrome | --chromium] [-cf <token>] [--days <N>] | stop <user> | list | passwd <user> [pass] | cf {add|set|remove} <user> [token] | ttl <user> <days> | rebuild [--pull] | api-key | rotate-api-key | help}"
 fi
 echo "========================================================"

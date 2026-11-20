@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Ephemeral Selkies VDI Host + REST API (setup-selkies-docker-host.sh v1.4)
+# Ephemeral Selkies VDI Host + REST API (setup-selkies-pve-host.sh v1.4)
 # ==============================================================================
 #
 # Usage:
 #   # Fresh install:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-docker-host.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-pve-host.sh)"
 #
 #   # Update an existing host (preserves /etc/vdi-ctl.conf & running sessions):
-#   bash setup-selkies-docker-host.sh --update [CTID] [--rebuild] [--pull]
+#   bash setup-selkies-pve-host.sh --update [CTID] [--rebuild] [--pull]
+#   # Or directly via curl (note the '--' before --update):
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-pve-host.sh)" -- --update [CTID] [--rebuild] [--pull]
 #
 # OVERVIEW
 # --------
@@ -40,7 +42,7 @@
 #   │   │ • selkies-alice (:3001)       │   │ • selkies-bob (:3001)         │ │
 #   │   │   (Firefox or Chromium + Sh)  │   │   (Firefox or Chromium + Sh)  │ │
 #   │   │ • cf-alice (Live CF Sidecar)  │   │ • cf-bob (Live CF Sidecar)    │ │
-#   │   │ • 2 vCPU / 1.8 GB / 512M tmpfs│   │ • 2 vCPU / 1.8 GB / 512M tmpfs│ │
+#   │   │ • 2 vCPU / 3 GB RAM / 1G shm  │   │ • 2 vCPU / 3 GB RAM / 1G shm  │ │
 #   │   └──────────────┬────────────────┘   └──────────────┬────────────────┘ │
 #   │                  │                                   │                  │
 #   │                  └─────────────────┬─────────────────┘                  │
@@ -86,7 +88,7 @@
 set -Eeuo pipefail
 
 VERSION="1.4"
-SCRIPT_NAME="selkies-docker-host"
+SCRIPT_NAME="selkies-pve-host"
 
 if [[ -t 1 ]]; then
   C_RST=$'\033[0m'; C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'
@@ -122,10 +124,13 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<'USAGEEOF'
 Usage:
-  setup-selkies-docker-host.sh                                  Fresh install (interactive)
-  setup-selkies-docker-host.sh --update [CTID]                  Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
-  setup-selkies-docker-host.sh --update [CTID] --rebuild        Also rebuild vcf-* images from pinned base tags
-  setup-selkies-docker-host.sh --update [CTID] --pull           Also pull newest upstream base images and rebuild
+  setup-selkies-pve-host.sh                                  Fresh install (interactive)
+  setup-selkies-pve-host.sh --update [CTID]                  Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
+  setup-selkies-pve-host.sh --update [CTID] --rebuild        Also rebuild vcf-* images from pinned base tags
+  setup-selkies-pve-host.sh --update [CTID] --pull           Also pull newest upstream base images and rebuild
+
+Online one-liner (note the '--' before --update):
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-pve-host.sh)" -- --update [CTID] [--rebuild] [--pull]
 USAGEEOF
       exit 0
       ;;
@@ -185,7 +190,7 @@ ask_secret() {
   printf -v "$__var" '%s' "$__a"
 }
 
-echo "=== ${SCRIPT_NAME} v${VERSION} (${MODE}) — Shared Docker Host + REST API for Ephemeral Selkies ==="
+echo "=== ${SCRIPT_NAME} v${VERSION} (${MODE}) — Shared PVE Host + REST API for Ephemeral Selkies ==="
 
 ask CTID "Host Container ID" "305"
 
@@ -243,7 +248,7 @@ SYSEOF
   FEATURES="nesting=1,keyctl=1"
   [[ "$STOR_TYPE" == "zfspool" ]] && FEATURES="nesting=1,keyctl=1,fuse=1"
 
-  log "Creating Docker Host LXC ${CTID} (${STOR_TYPE}, features=${FEATURES})..."
+  log "Creating PVE Host LXC ${CTID} (${STOR_TYPE}, features=${FEATURES})..."
   pct create "$CTID" "$TPL_VOLID" \
     --ostype debian \
     --arch amd64 \
@@ -860,7 +865,8 @@ Day-2 Operations:
       in /etc/vdi-ctl.conf. Pass --pull to fetch newest upstream images.
 
 Host Updates (run on Proxmox host):
-  setup-selkies-docker-host.sh --update [CTID] [--rebuild | --pull]
+  setup-selkies-pve-host.sh --update [CTID] [--rebuild | --pull]
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-pve-host.sh)" -- --update [CTID] [--rebuild | --pull]
       --update           : Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
       --update --rebuild : Also rebuild vcf-* images from pinned base tags
       --update --pull    : Also pull newest upstream images and rebuild
@@ -1212,13 +1218,13 @@ API_PORT="$(pct exec "$CTID" -- bash -c "source /etc/vdi-ctl.conf && echo \${VDI
 echo
 echo "========================================================"
 if [[ "$MODE" == "update" ]]; then
-  ok "Updated Selkies Docker Host + REST API on LXC ${CTID} (v${VERSION})"
+  ok "Updated Selkies PVE Host + REST API on LXC ${CTID} (v${VERSION})"
   echo "--------------------------------------------------------"
   echo "  REST Endpoint : http://${HOST_IP}:${API_PORT}"
   echo "  Bearer Token  : (preserved — run 'vdi-ctl api-key' to view)"
   echo "  CLI Help      : vdi-ctl help"
 else
-  ok "Shared Selkies Docker Host + REST API ready on LXC ${CTID}"
+  ok "Shared Selkies PVE Host + REST API ready on LXC ${CTID}"
   echo "--------------------------------------------------------"
   echo "  REST Endpoint : http://${HOST_IP}:${API_PORT}"
   echo "  Bearer Token  : ${API_KEY}"

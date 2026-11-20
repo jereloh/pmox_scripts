@@ -9,6 +9,8 @@
 #
 #   # Update an existing host (preserves /etc/vdi-ctl.conf & running sessions):
 #   bash setup-selkies-photon.sh --update [--rebuild] [--pull]
+#   # Or directly via curl (note the '--' before --update):
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-photon.sh)" -- --update [--rebuild] [--pull]
 #
 # OVERVIEW
 # --------
@@ -120,6 +122,9 @@ Usage:
   setup-selkies-photon.sh --update                   Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
   setup-selkies-photon.sh --update --rebuild         Also rebuild vcf-* images from pinned base tags
   setup-selkies-photon.sh --update --pull            Also pull newest upstream base images and rebuild
+
+Online one-liner (note the '--' before --update):
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-photon.sh)" -- --update [--rebuild] [--pull]
 USAGEEOF
       exit 0
       ;;
@@ -838,6 +843,7 @@ Day-2 Operations:
 
 Host Updates (run on Photon OS host):
   setup-selkies-photon.sh --update [--rebuild | --pull]
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/jereloh/pmox_scripts/main/setup-selkies-photon.sh)" -- --update [--rebuild | --pull]
       --update           : Update vdi-ctl, vdi-api, and systemd units (no image rebuild)
       --update --rebuild : Also rebuild vcf-* images from pinned base tags
       --update --pull    : Also pull newest upstream images and rebuild
